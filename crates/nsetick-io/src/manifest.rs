@@ -35,6 +35,10 @@ pub struct Manifest {
     pub layout_verified: bool,
     pub session_date: String,
 
+    /// Free-text note from the run spec, recording why this run was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+
     pub filter: String,
     pub selected_fields: Vec<String>,
     pub partition_by: Option<String>,
@@ -94,6 +98,7 @@ mod tests {
             record_length: 87,
             layout_verified: true,
             session_date: "2022-01-27".into(),
+            note: None,
             filter: "series == 'EQ'".into(),
             selected_fields: vec!["symbol".into(), "txn_time".into()],
             partition_by: Some("symbol".into()),

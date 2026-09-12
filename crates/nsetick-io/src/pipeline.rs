@@ -1,24 +1,47 @@
 //! End-to-end parse: gzip in, partitioned Parquet out.
 //!
-//! Inflate runs on its own thread and hands record-aligned chunks to the decoder over a
-//! bounded channel. A deflate stream cannot be decompressed by more than one thread, so the
-//! aim is not to parallelise it but to make sure nothing waits on it: decoding, encoding and
-//! writing all overlap with the inflate of the next chunk. At 200-450 MB/s inflate against a
-//! 58 GB session, everything else has to stay off the critical path.
+//! A deflate stream cannot be decompressed by more than one thread, so inflate is a fixed
+//! serial cost and everything else has to get out of its way. Measured on a 30M-record slice
+//! of a CM orders session, all 17 columns:
+//!
+//! ```text
+//!   inflate                     4.3s
+//!   decode + parquet encode    ~24.5s
+//!   partition split            ~13.3s
+//!   zstd                       ~10.6s
+//! ```
+//!
+//! Inflate is under a tenth of the work, and the rest parallelises, so the pipeline is:
+//!
+//! ```text
+//!   inflate thread  ->  decode workers  ->  reorder  ->  writer shards
+//!      (serial)          (N threads)        (1)          (M threads)
+//! ```
+//!
+//! Decode workers also do the partition split, since that is the second most expensive stage
+//! and is embarrassingly parallel. Writer shards own disjoint sets of symbols, so each owns
+//! its own files and does its own Parquet encoding and compression with no shared state.
+//!
+//! Ordering is preserved deliberately: chunks carry a sequence number and are re-ordered
+//! before routing, so each symbol's rows reach its writer in the order NSE emitted them.
+//! That is what makes the output time-sorted without a sort.
 
-use std::io::Read;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
+use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use nsetick_core::decode::{DecodeOptions, Decoder, Stats};
-use nsetick_core::filter;
-use nsetick_core::layout::{self, Layout};
+use nsetick_core::filter::{self, Predicate};
+use nsetick_core::layout::{self, Layout, Version};
 
 use crate::manifest::{Manifest, PartitionRecord};
 use crate::reader::{read_trigger, RecordReader, DEFAULT_CHUNK_BYTES};
-use crate::writer::{PartitionedWriter, WriterOptions};
+use crate::writer::{split_by_partition, PartitionSummary, PartitionedWriter, WriterOptions};
 
 #[derive(Debug, Clone)]
 pub struct ParseRequest {
@@ -38,6 +61,11 @@ pub struct ParseRequest {
     /// Stop after roughly this many records have been read. Rounded up to a chunk boundary.
     /// Intended for smoke tests against multi-gigabyte sessions.
     pub max_records: Option<u64>,
+    /// Free-text note recorded in the manifest.
+    pub note: Option<String>,
+    /// Worker threads for decoding and writing. `None` picks a default from the machine.
+    /// `Some(1)` runs the whole pipeline on one thread besides the inflate.
+    pub threads: Option<usize>,
 }
 
 impl ParseRequest {
@@ -59,8 +87,17 @@ impl ParseRequest {
             verify_trigger: true,
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             max_records: None,
+            note: None,
+            threads: None,
         }
     }
+}
+
+/// Leave a core for the inflate thread and one for the OS; never fewer than one worker.
+pub fn default_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(1)
 }
 
 #[derive(Debug, Clone)]
@@ -72,6 +109,7 @@ pub struct RunReport {
     pub manifest_path: PathBuf,
     pub spec_version: String,
     pub record_length: usize,
+    pub threads: usize,
 }
 
 impl RunReport {
@@ -92,14 +130,12 @@ impl RunReport {
 
 /// Determine the record length by finding the first LF in the decompressed stream.
 ///
-/// This is what makes a wrong layout a startup error instead of 665 million silently
-/// misaligned rows. It reads only the first few kilobytes.
+/// This is what makes a wrong layout a startup error instead of hundreds of millions of
+/// silently misaligned rows. It reads only the first few kilobytes.
 pub fn probe_record_length(path: &Path) -> Result<usize> {
     // 1024 is comfortably larger than the longest NSE record (124 bytes).
     let mut reader = RecordReader::open(path, 1, 4096)?;
-    let chunk = reader
-        .next_chunk()?
-        .context("file is empty")?;
+    let chunk = reader.next_chunk()?.context("file is empty")?;
     let head = &chunk[..chunk.len().min(1024)];
     match head.iter().position(|b| *b == b'\n') {
         // The record length excludes the delimiter.
@@ -120,6 +156,26 @@ pub fn resolve_version(layout: &Layout, path: &Path, date: NaiveDate) -> Result<
     Ok((version.spec_version.clone(), version.record_length))
 }
 
+fn shard_of(key: &str, shards: usize) -> usize {
+    if shards <= 1 {
+        return 0;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut h);
+    (h.finish() % shards as u64) as usize
+}
+
+/// One decoded, already-split chunk on its way to the writers.
+///
+/// Groups are bucketed by destination shard here rather than routed one at a time. A chunk
+/// of a CM session splits into ~625 per-symbol batches, and sending those individually cost
+/// more in channel traffic than the parallel writers saved.
+struct Decoded {
+    seq: u64,
+    by_shard: Vec<Vec<(String, RecordBatch)>>,
+    stats: Stats,
+}
+
 pub fn run(req: &ParseRequest) -> Result<RunReport> {
     let started = Instant::now();
 
@@ -134,7 +190,7 @@ pub fn run(req: &ParseRequest) -> Result<RunReport> {
     // Pick the layout version from the file itself, not from an assumption.
     let observed = probe_record_length(&req.input)
         .with_context(|| format!("probing record length of {}", req.input.display()))?;
-    let version = layout.resolve(req.session_date, Some(observed))?.clone();
+    let version: Version = layout.resolve(req.session_date, Some(observed))?.clone();
 
     if !version.verified {
         eprintln!(
@@ -156,78 +212,12 @@ pub fn run(req: &ParseRequest) -> Result<RunReport> {
         ("kind".to_string(), layout.meta.kind.clone()),
         ("date".to_string(), req.session_date.to_string()),
     ];
-    let mut writer = PartitionedWriter::new(
-        &req.out_root,
-        prefix,
-        decoder.schema(),
-        req.writer.clone(),
-    )?;
 
-    // Inflate on its own thread. A small bound is deliberate: chunks are 8 MB, and letting
-    // the reader run far ahead only trades memory for nothing once the consumer keeps up.
-    let (tx, rx) = crossbeam_channel::bounded::<Result<Vec<u8>>>(4);
-    let input = req.input.clone();
-    let line_len = version.line_length();
-    let chunk_bytes = req.chunk_bytes;
+    let threads = req.threads.unwrap_or_else(default_threads).max(1);
 
-    let reader_thread = std::thread::Builder::new()
-        .name("nsetick-inflate".into())
-        .spawn(move || -> Result<u64> {
-            let mut reader = RecordReader::open(&input, line_len, chunk_bytes)?;
-            loop {
-                match reader.next_chunk() {
-                    Ok(Some(chunk)) => {
-                        if tx.send(Ok(chunk)).is_err() {
-                            // Consumer stopped early; stop inflating rather than finishing
-                            // 58 GB nobody will read.
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        break;
-                    }
-                }
-            }
-            Ok(reader.bytes_read())
-        })
-        .context("spawning the inflate thread")?;
+    let (stats, bytes_decompressed, partitions) =
+        execute(req, &version, decoder, predicate, prefix, threads)?;
 
-    let mut stats = Stats::default();
-    let mut decode_error = None;
-
-    for message in rx.iter() {
-        if let Some(limit) = req.max_records {
-            if stats.rows_read >= limit {
-                // Dropping the receiver signals the inflate thread to stop.
-                break;
-            }
-        }
-        let chunk = message?;
-        match decoder.decode(&chunk, &predicate, &mut stats) {
-            Ok(batch) => {
-                if batch.num_rows() > 0 {
-                    writer.write(&batch)?;
-                }
-            }
-            Err(e) => {
-                decode_error = Some(e);
-                break;
-            }
-        }
-    }
-
-    drop(rx);
-    let bytes_decompressed = reader_thread
-        .join()
-        .map_err(|_| anyhow::anyhow!("the inflate thread panicked"))??;
-
-    if let Some(e) = decode_error {
-        return Err(e);
-    }
-
-    let partitions = writer.finish()?;
     let elapsed = started.elapsed().as_secs_f64();
 
     let manifest = Manifest {
@@ -241,12 +231,12 @@ pub fn run(req: &ParseRequest) -> Result<RunReport> {
         record_length: version.record_length,
         layout_verified: version.verified,
         session_date: req.session_date.to_string(),
+        note: req.note.clone(),
         filter: req.filter.clone(),
-        selected_fields: decoder
-            .projected_names()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        selected_fields: req
+            .select
+            .clone()
+            .unwrap_or_else(|| version.fields.iter().map(|f| f.name.clone()).collect()),
         partition_by: req.writer.partition_by.clone(),
         strict: req.strict,
         rows_read: stats.rows_read,
@@ -274,7 +264,207 @@ pub fn run(req: &ParseRequest) -> Result<RunReport> {
         manifest_path,
         spec_version: version.spec_version,
         record_length: version.record_length,
+        threads,
     })
+}
+
+#[allow(clippy::type_complexity)]
+fn execute(
+    req: &ParseRequest,
+    version: &Version,
+    decoder: Decoder,
+    predicate: Predicate,
+    prefix: Vec<(String, String)>,
+    threads: usize,
+) -> Result<(Stats, u64, Vec<PartitionSummary>)> {
+    let schema = decoder.schema();
+    let part_col = match &req.writer.partition_by {
+        None => None,
+        Some(name) => Some(schema.index_of(name).map_err(|_| {
+            anyhow::anyhow!(
+                "cannot partition by {name:?} because it is not in the output schema. \
+                 Either include it in --select or pass --partition-by none."
+            )
+        })?),
+    };
+
+    // Without a partition column every shard would write the same file path, so there can
+    // only be one writer.
+    let shards = if part_col.is_some() { threads } else { 1 };
+
+    let decoder = Arc::new(decoder);
+    let predicate = Arc::new(predicate);
+    let line_len = version.line_length();
+
+    let (chunk_tx, chunk_rx) = crossbeam_channel::bounded::<(u64, Vec<u8>)>(threads * 2);
+    let (dec_tx, dec_rx) = crossbeam_channel::bounded::<Result<Decoded>>(threads * 2);
+
+    type ShardMsg = Vec<(String, RecordBatch)>;
+    let mut shard_txs = Vec::with_capacity(shards);
+    let mut shard_rxs = Vec::with_capacity(shards);
+    for _ in 0..shards {
+        let (t, r) = crossbeam_channel::bounded::<ShardMsg>(8);
+        shard_txs.push(t);
+        shard_rxs.push(r);
+    }
+
+    let mut stats = Stats::default();
+    let mut bytes_decompressed = 0u64;
+    let mut summaries: Vec<PartitionSummary> = Vec::new();
+    let mut route_error: Option<anyhow::Error> = None;
+
+    std::thread::scope(|scope| -> Result<()> {
+        // --- inflate ------------------------------------------------------------------
+        let input = req.input.clone();
+        let chunk_bytes = req.chunk_bytes;
+        let reader_handle = scope.spawn(move || -> Result<u64> {
+            let mut reader = RecordReader::open(&input, line_len, chunk_bytes)?;
+            let mut seq = 0u64;
+            loop {
+                match reader.next_chunk() {
+                    Ok(Some(chunk)) => {
+                        if chunk_tx.send((seq, chunk)).is_err() {
+                            // Consumers stopped; no point inflating the rest of 56 GB.
+                            break;
+                        }
+                        seq += 1;
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        drop(chunk_tx);
+                        return Err(e);
+                    }
+                }
+            }
+            Ok(reader.bytes_read())
+        });
+
+        // --- decode + split -----------------------------------------------------------
+        let mut decode_handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let rx = chunk_rx.clone();
+            let tx = dec_tx.clone();
+            let decoder = Arc::clone(&decoder);
+            let predicate = Arc::clone(&predicate);
+            decode_handles.push(scope.spawn(move || {
+                for (seq, chunk) in rx.iter() {
+                    let mut local = Stats::default();
+                    let decoded = decoder
+                        .decode(&chunk, &predicate, &mut local)
+                        .and_then(|batch| {
+                            let mut by_shard: Vec<Vec<(String, RecordBatch)>> =
+                                vec![Vec::new(); shards];
+                            if batch.num_rows() > 0 {
+                                match part_col {
+                                    None => by_shard[0].push((String::new(), batch)),
+                                    Some(idx) => {
+                                        for (key, slice) in split_by_partition(&batch, idx)? {
+                                            by_shard[shard_of(&key, shards)].push((key, slice));
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(Decoded {
+                                seq,
+                                by_shard,
+                                stats: local,
+                            })
+                        });
+                    let failed = decoded.is_err();
+                    if tx.send(decoded).is_err() || failed {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(dec_tx);
+        drop(chunk_rx);
+
+        // --- writer shards ------------------------------------------------------------
+        let mut writer_handles = Vec::with_capacity(shards);
+        for rx in shard_rxs.into_iter() {
+            let root = req.out_root.clone();
+            let prefix = prefix.clone();
+            let schema = Arc::clone(&schema);
+            let opts = req.writer.clone();
+            writer_handles.push(scope.spawn(move || -> Result<Vec<PartitionSummary>> {
+                let mut w = PartitionedWriter::new(root, prefix, schema, opts)?;
+                for group in rx.iter() {
+                    for (key, batch) in group {
+                        w.write_partition(&key, batch)?;
+                    }
+                }
+                w.finish()
+            }));
+        }
+
+        // --- reorder and route --------------------------------------------------------
+        // Chunks finish out of order; restoring sequence order here is what keeps each
+        // symbol's rows in the order NSE wrote them.
+        let mut pending: HashMap<u64, Decoded> = HashMap::new();
+        let mut next_seq = 0u64;
+        let mut stop = false;
+
+        'outer: for message in dec_rx.iter() {
+            let decoded = match message {
+                Ok(d) => d,
+                Err(e) => {
+                    route_error = Some(e);
+                    break 'outer;
+                }
+            };
+            pending.insert(decoded.seq, decoded);
+
+            while let Some(d) = pending.remove(&next_seq) {
+                next_seq += 1;
+                stats.merge(d.stats);
+                for (idx, group) in d.by_shard.into_iter().enumerate() {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    if shard_txs[idx].send(group).is_err() {
+                        route_error = Some(anyhow::anyhow!("a writer shard stopped early"));
+                        break 'outer;
+                    }
+                }
+                if let Some(limit) = req.max_records {
+                    if stats.rows_read >= limit {
+                        stop = true;
+                        break;
+                    }
+                }
+            }
+            if stop {
+                break;
+            }
+        }
+
+        // Closing the shard senders lets the writers finish and close their files.
+        drop(shard_txs);
+        // Draining lets the decode workers exit instead of blocking on a full channel.
+        drop(dec_rx);
+
+        for h in decode_handles {
+            h.join().map_err(|_| anyhow::anyhow!("a decode worker panicked"))?;
+        }
+        for h in writer_handles {
+            let part = h
+                .join()
+                .map_err(|_| anyhow::anyhow!("a writer shard panicked"))??;
+            summaries.extend(part);
+        }
+        bytes_decompressed = reader_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("the inflate thread panicked"))??;
+        Ok(())
+    })?;
+
+    if let Some(e) = route_error {
+        return Err(e);
+    }
+
+    summaries.sort_by(|a, b| a.key.cmp(&b.key));
+    Ok((stats, bytes_decompressed, summaries))
 }
 
 /// Read the first `n` decompressed bytes of a file, for inspection commands.
@@ -285,21 +475,3 @@ pub fn head_bytes(path: &Path, n: usize) -> Result<Vec<u8>> {
     out.truncate(n);
     Ok(out)
 }
-
-/// Read the whole of a small file, used by tests and `nsetick inspect`.
-pub fn read_to_end(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let mut reader = RecordReader::open(path, 1, 1 << 20)?;
-    let mut out = Vec::new();
-    while let Some(c) = reader.next_chunk()? {
-        out.extend_from_slice(&c);
-        if out.len() >= limit {
-            out.truncate(limit);
-            break;
-        }
-    }
-    Ok(out)
-}
-
-/// Present so `Read` stays imported for the trait-object bound in `reader`.
-#[allow(dead_code)]
-fn _assert_read_in_scope<T: Read>() {}

@@ -1,0 +1,17 @@
+{
+  "defaults": {
+    "out": "data/parquet",
+    "where": "series == 'EQ'",
+    "threads": 6,
+    "note": "2022 expiry-day study: all EQ series, full universe"
+  },
+  "jobs": [
+    { "input": "data/raw/CASH_Orders_27012022.DAT.gz" },
+    { "input": "data/raw/CASH_Trades_27012022.DAT.gz" },
+    {
+      "input": "data/raw/CASH_Orders_24022022.DAT.gz",
+      "select": ["symbol", "txn_time", "buy_sell", "limit_price", "volume_original", "volume_disclosed"],
+      "note": "only the columns the iceberg detector needs"
+    }
+  ]
+}

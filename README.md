@@ -4,8 +4,27 @@ Fast, correct parsing of NSE historical order and trade data into Parquet.
 
 NSE ships its historical tick data as gzipped fixed-width text. A single session of Capital
 Market orders is 8.3 GB compressed, 56 GB decompressed, and 684 million records. `nsetick`
-turns that into partitioned Parquet at around 280 MB/s, and is designed to be the one parser
-shared across every project that touches this data.
+turns that into partitioned Parquet, and is designed to be the one parser shared across every
+project that touches this data.
+
+## Performance
+
+Against the DuckDB `read_csv` + `SUBSTRING` approach these pipelines used before, on an
+identical 8,000,000-record fixture, same filter (`series == 'EQ'`), same output shape (one
+Snappy file, all 17 columns), 8-core Windows machine:
+
+| | time | output |
+|---|---|---|
+| DuckDB | 22.3 s | 116 MB |
+| nsetick, same shape | **5.7 s** | 116 MB |
+| nsetick, default (ZSTD, partitioned by symbol) | 8.6 s | **72 MB** |
+
+Both produce 7,967,699 rows with identical symbol sets and identical column checksums.
+
+Three things account for it: `zlib-rs` for inflate (582 MB/s vs 324 MB/s for the default
+backend), a pipeline that overlaps inflate with parallel decode and sharded writers, and
+mimalloc, because Arrow arrays are allocated on one thread and freed on another and the
+Windows system allocator serialises badly on that pattern. mimalloc alone was worth 2.4x.
 
 ## Why it exists
 
@@ -38,6 +57,36 @@ nsetick describe cm_orders --date 2022-01-27
 # Decode the first few records without writing anything.
 nsetick inspect CASH_Orders_27012022.DAT.gz --n 5
 ```
+
+### Run specs
+
+Anything the command line can express can also be a JSON file, which is the better option
+when the run is part of a study and needs to be reproducible. Unknown fields are rejected, so
+a typo is an error rather than a silently ignored setting.
+
+```bash
+nsetick run study.json            # execute
+nsetick run study.json --dry-run  # show the resolved jobs and stop
+```
+
+```json
+{
+  "defaults": {
+    "out": "data/parquet",
+    "where": "series == 'EQ'",
+    "threads": 6,
+    "note": "2022 expiry-day study: all EQ series, full universe"
+  },
+  "jobs": [
+    { "input": "data/raw/CASH_Orders_27012022.DAT.gz" },
+    { "input": "data/raw/CASH_Trades_27012022.DAT.gz" }
+  ]
+}
+```
+
+Job fields override `defaults`. Relative paths resolve against the spec file, so a spec
+travels with the data it describes. `layout` and `date` are inferred from the file name
+unless set. `note` is carried into the manifest. See [`examples/session.json`](examples/session.json).
 
 Read the result from anywhere:
 
@@ -74,8 +123,12 @@ date: `txn_time >= '09:15:00'`.
 
 Partitioning by symbol is free: NSE writes each symbol's records contiguously and in time
 order, so the partitions come out time-sorted with no sort step. Every run writes a manifest
-recording the source file, layout version, filter, projection and row counts, so a directory
-of Parquet can be traced back to what produced it.
+recording the source file, layout version, filter, projection, note and row counts, so a
+directory of Parquet can be traced back to what produced it.
+
+Useful knobs: `--partition-by none` for a single file per date, `-j/--threads` for worker
+count, `--compression zstd|snappy|none`, `--row-group-rows`, `--max-buffered-mb`,
+`--chunk-mb`, and `--max-records` for smoke tests on multi-gigabyte files.
 
 ## Layouts
 
