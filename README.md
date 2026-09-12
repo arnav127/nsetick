@@ -130,6 +130,36 @@ Useful knobs: `--partition-by none` for a single file per date, `-j/--threads` f
 count, `--compression zstd|snappy|none`, `--row-group-rows`, `--max-buffered-mb`,
 `--chunk-mb`, and `--max-records` for smoke tests on multi-gigabyte files.
 
+## Memory
+
+Partitioning by symbol keeps one Parquet writer open per symbol for the whole run, because
+NSE interleaves every symbol throughout the session and a closed Parquet file cannot be
+reopened to append. That, not buffering, is what decides whether a run fits:
+
+| configuration | peak RSS |
+|---|---|
+| one file, 1 thread | 269 MB |
+| one file, 6 threads | 532 MB |
+| 620 symbol partitions, 1 thread | 1.56 GB |
+| 620 symbol partitions, 6 threads | 2.02 GB |
+
+So roughly **2 MB per open partition**, independent of row-group budget or page size. A full
+~2000-symbol Capital Market session therefore plans for about 5 GB and fits comfortably in
+8 GB.
+
+`nsetick` derives a footprint ceiling from the memory actually available when it starts and
+checks it as each partition is opened, so a run that cannot fit **stops with an explanation
+and suggested remedies rather than exhausting the machine**. Override it with
+`--memory-limit-mb`. Every run reports what it used:
+
+```text
+memory            ~1.5 GB peak of 9.7 GB limit (619 partitions open)
+```
+
+Raising the buffer budget does not buy throughput: measured across budgets from 64 MB to
+3 GB, an 8M-record session took 7.4s to 7.9s, which is noise. The knob that matters is
+`-j/--threads` (0.71 to 1.21 M rows/s going from 1 to 6).
+
 ## Layouts
 
 | layout | segment | record length |

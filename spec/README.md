@@ -105,5 +105,20 @@ files from 2020-12-01. nsetick can verify against these rather than merely skipp
 been checked against a real file, because no such file was available locally. Currently: all
 CD layouts, `cm_index`, and the pre-changeover FAO variants.
 
+`fao_orders@1.7` and `fao_trades@1.2` have now been confirmed against real April 2022 files.
+The checks that settle it, on `FAO_Trades_28042022_01.DAT.gz`:
+
+* `trade_number` runs unbroken from `20220428000000001` to `20220428002013270` across
+  2,013,270 records, which only holds if the 17-byte field and every following offset are
+  right and no record was skipped or double counted;
+* every trade quantity is divisible by 50, the NIFTY lot size, with zero exceptions, which
+  confirms both the quantity offset and the spec's claim that FAO volumes are shares rather
+  than contracts;
+* strikes land in 14350.00 to 19550.00 rupees and expiry decodes to 2022-04-28, the Thursday
+  expiry, from the `ddMMMyyyy` field.
+
+On the orders side `limit_price_ind` decodes as a clean Y/N and `segment` arrives as `FAOb`,
+confirming the spec-1.7 112-byte record and the trailing-pad handling.
+
 `cm_index` additionally carries a **spec contradiction**: its field lengths sum to 38 bytes
 but the document's "Total Length" cell says 24. 38 is used; see the file's header comment.

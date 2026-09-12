@@ -5,12 +5,14 @@ use std::path::Path;
 use chrono::NaiveDate;
 
 pub mod manifest;
+pub mod memory;
 pub mod pipeline;
 pub mod reader;
 pub mod spec;
 pub mod writer;
 
 pub use manifest::Manifest;
+pub use memory::MemoryGuard;
 pub use pipeline::{probe_record_length, run, ParseRequest, RunReport};
 pub use reader::{read_trigger, RecordReader, Trigger};
 pub use spec::{JobSpec, ResolvedJob};

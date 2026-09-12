@@ -34,14 +34,24 @@ use parquet::arrow::ArrowWriter;
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
+use crate::memory::MemoryGuard;
+
 #[derive(Debug, Clone)]
 pub struct WriterOptions {
     pub compression: Compression,
     /// Target rows per row group. 256k rows of a CM order record is roughly 20 MB
     /// uncompressed, which keeps row-group pruning granular without fragmenting pages.
     pub row_group_rows: usize,
-    /// Ceiling on bytes buffered across all open partitions before the largest is spilled.
+    /// Ceiling on bytes buffered across all open partitions, in every shard, before the
+    /// largest is spilled. Shared globally rather than applied per shard.
     pub max_buffered_bytes: usize,
+    /// Bytes each column writer may buffer before it cuts a data page.
+    ///
+    /// This is the dominant memory cost when writing many partitions at once: every open
+    /// partition holds one such buffer per column, so the footprint is roughly
+    /// `partitions x columns x page_size`. Large pages compress marginally better; small
+    /// pages are what make a 2000-symbol session fit in memory.
+    pub data_page_size: usize,
     /// Column to partition on, in addition to the fixed segment/kind/date prefix.
     pub partition_by: Option<String>,
 }
@@ -52,6 +62,7 @@ impl Default for WriterOptions {
             compression: Compression::ZSTD(ZstdLevel::try_new(3).expect("level 3 is valid")),
             row_group_rows: 256_000,
             max_buffered_bytes: 256 * 1024 * 1024,
+            data_page_size: 64 * 1024,
             partition_by: Some("symbol".to_string()),
         }
     }
@@ -135,6 +146,9 @@ struct Partition {
 
 pub struct PartitionedWriter {
     root: PathBuf,
+    /// Shared with every other shard, so limits are totals rather than per-shard allowances
+    /// that silently multiply by the thread count.
+    budget: Arc<MemoryGuard>,
     prefix: Vec<(String, String)>,
     schema: SchemaRef,
     props: WriterProperties,
@@ -142,9 +156,6 @@ pub struct PartitionedWriter {
     /// Index of the partition column within the schema, resolved once.
     part_col: Option<usize>,
     parts: HashMap<String, Partition>,
-    /// Running sum of every partition's `in_progress`, maintained incrementally so the write
-    /// path does not walk 2000 partitions per batch.
-    buffered_bytes: usize,
     rows_written: u64,
 }
 
@@ -156,6 +167,18 @@ impl PartitionedWriter {
         prefix: Vec<(String, String)>,
         schema: SchemaRef,
         opts: WriterOptions,
+    ) -> Result<Self> {
+        let budget = MemoryGuard::new(usize::MAX / 4, opts.max_buffered_bytes);
+        Self::with_budget(root, prefix, schema, opts, budget)
+    }
+
+    /// Build a shard that shares an existing budget with its siblings.
+    pub fn with_budget(
+        root: impl AsRef<Path>,
+        prefix: Vec<(String, String)>,
+        schema: SchemaRef,
+        opts: WriterOptions,
+        budget: Arc<MemoryGuard>,
     ) -> Result<Self> {
         let part_col = match &opts.partition_by {
             None => None,
@@ -181,19 +204,19 @@ impl PartitionedWriter {
             .set_compression(opts.compression)
             .set_max_row_group_row_count(Some(opts.row_group_rows))
             .set_statistics_enabled(EnabledStatistics::Chunk)
-            .set_data_page_size_limit(1024 * 1024)
+            .set_data_page_size_limit(opts.data_page_size)
             .set_created_by(format!("nsetick {}", env!("CARGO_PKG_VERSION")))
             .build();
 
         Ok(Self {
             root: root.as_ref().to_path_buf(),
+            budget,
             prefix,
             schema,
             props,
             opts,
             part_col,
             parts: HashMap::new(),
-            buffered_bytes: 0,
             rows_written: 0,
         })
     }
@@ -216,6 +239,8 @@ impl PartitionedWriter {
 
     fn partition_mut(&mut self, key: &str) -> Result<&mut Partition> {
         if !self.parts.contains_key(key) {
+            self.budget
+                .open_partition(self.opts.partition_by.as_deref().unwrap_or("nothing"))?;
             let dir = self.dir_for(key);
             fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             let path = dir.join("part-000.parquet");
@@ -275,13 +300,17 @@ impl PartitionedWriter {
         part.in_progress = part.writer.in_progress_size();
         let after = part.in_progress;
 
-        self.buffered_bytes = self.buffered_bytes + after - before.min(after);
+        self.budget.adjust(before, after);
         self.enforce_budget()
     }
 
-    /// Close row groups on the largest partitions until the byte budget is satisfied.
+    /// Close row groups on the largest partitions until the shared budget is satisfied.
+    ///
+    /// A shard only ever flushes its own partitions. When another shard is holding most of
+    /// the memory this shard runs out of things to flush and gives up; that shard will hit
+    /// the same condition on its next write and flush its own.
     fn enforce_budget(&mut self) -> Result<()> {
-        while self.buffered_bytes > self.opts.max_buffered_bytes {
+        while self.budget.over_buffer_limit() {
             let Some(key) = self
                 .parts
                 .iter()
@@ -305,7 +334,7 @@ impl PartitionedWriter {
         part.writer
             .flush()
             .with_context(|| format!("flushing row group in {}", part.path.display()))?;
-        self.buffered_bytes = self.buffered_bytes.saturating_sub(part.in_progress);
+        self.budget.release(part.in_progress);
         part.in_progress = 0;
         Ok(())
     }
@@ -322,6 +351,7 @@ impl PartitionedWriter {
     pub fn finish(mut self) -> Result<Vec<PartitionSummary>> {
         let mut out = Vec::with_capacity(self.parts.len());
         for (key, part) in self.parts.drain() {
+            self.budget.release(part.in_progress);
             let path = part.path.clone();
             let rows = part.rows_total;
             part.writer
@@ -501,9 +531,9 @@ mod tests {
         // The budget is enforced after each partition write, so the steady state stays near
         // the limit rather than growing with the input.
         assert!(
-            w.buffered_bytes <= 4096 + 64 * 1024,
+            w.budget.used() <= 4096 + 64 * 1024,
             "buffer grew to {} bytes",
-            w.buffered_bytes
+            w.budget.used()
         );
         let s = w.finish().unwrap();
         assert_eq!(s.iter().map(|p| p.rows).sum::<u64>(), 1500);

@@ -111,9 +111,16 @@ struct ParseArgs {
     #[arg(long, default_value_t = 256_000)]
     row_group_rows: usize,
 
-    /// Ceiling in megabytes on what is buffered across all open partitions.
-    #[arg(long, default_value_t = 256)]
-    max_buffered_mb: usize,
+    /// Kilobytes each column writer buffers before cutting a data page. The dominant cost
+    /// when writing thousands of partitions at once.
+    #[arg(long, default_value_t = 64)]
+    data_page_kb: usize,
+
+    /// Ceiling in megabytes on this run's total memory footprint. Omit to derive one from
+    /// the memory currently available on this machine. The run refuses to start opening more
+    /// partitions than fit rather than exhausting the machine.
+    #[arg(long)]
+    memory_limit_mb: Option<usize>,
 
     /// Count malformed records and carry on instead of stopping at the first one.
     #[arg(long)]
@@ -199,11 +206,13 @@ fn cmd_parse(args: ParseArgs) -> Result<()> {
     req.verify_trigger = !args.no_verify;
     req.max_records = args.max_records;
     req.threads = args.threads;
+    req.memory_limit = args.memory_limit_mb.map(|mb| mb * 1024 * 1024);
     req.chunk_bytes = args.chunk_mb * 1024 * 1024;
     req.writer = WriterOptions {
         compression,
         row_group_rows: args.row_group_rows,
-        max_buffered_bytes: args.max_buffered_mb * 1024 * 1024,
+        max_buffered_bytes: 0, // superseded by req.memory_limit below
+        data_page_size: args.data_page_kb * 1024,
         partition_by,
     };
 
@@ -232,6 +241,12 @@ fn print_report(report: &pipeline::RunReport) {
     }
     println!("partitions        {}", report.partitions);
     println!("threads           {}", report.threads);
+    println!(
+        "memory            ~{} peak of {} limit ({} partitions open)",
+        nsetick_io::memory::human(report.memory_peak),
+        nsetick_io::memory::human(report.memory_limit),
+        report.partitions_peak
+    );
     println!(
         "elapsed           {:.1}s  ({:.0} MB/s decompressed, {:.2} M rows/s)",
         report.elapsed_secs,
