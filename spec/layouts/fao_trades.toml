@@ -1,0 +1,69 @@
+# NSE Futures & Options - Trade records.
+# Source of truth: "Historical Data Orders and Trade Layout" v1.10 (27 Jul 2022), section 2.2.
+#
+# The PDF states explicitly: "Trade ID size till 04 September 2020 was 16 bytes and the trade
+# structure total size was 123 bytes, from 7 September 2020 it is 17 bytes and the trade
+# structure total size is 124 bytes." Both versions are encoded below. Note this shifts EVERY
+# field after the trade number by one byte - parsing a pre-Sep-2020 file with the 124-byte
+# layout yields silently corrupt output, which is why version selection is by date AND
+# validated against observed record length.
+
+[layout]
+id          = "fao_trades"
+segment     = "FAO"
+kind        = "trades"
+description = "Equity Derivatives Market Trades Data"
+delimiter   = "LF"
+file_glob   = "FAO_Trades_{date}*.DAT.gz"
+split_files = true
+
+[[version]]
+spec_version  = "1.2"
+valid_from    = 2020-09-07
+valid_to      = 9999-12-31
+record_length = 124
+fields = [
+  { name = "record_indicator",     offset =   0, len =  2, type = "str", values = ["RM"] },
+  { name = "segment",              offset =   2, len =  4, type = "str", pad = "right", values = ["FAO"] },
+  { name = "trade_number",         offset =   6, len = 17, type = "u64", doc = "17 bytes from 2020-09-07" },
+  { name = "txn_time",             offset =  23, len = 14, type = "jiffies" },
+  { name = "symbol",               offset =  37, len = 10, type = "str", pad = "left" },
+  { name = "instrument",           offset =  47, len =  6, type = "str", values = ["FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK"] },
+  { name = "expiry_date",          offset =  53, len =  9, type = "date_dmmmy" },
+  { name = "strike_price",         offset =  62, len =  8, type = "price", scale = 2 },
+  { name = "option_type",          offset =  70, len =  2, type = "str", values = ["CA", "PA", "CE", "PE", "FF"] },
+  { name = "trade_price",          offset =  72, len =  8, type = "price", scale = 2 },
+  { name = "trade_quantity",       offset =  80, len =  8, type = "u64" },
+  { name = "buy_order_number",     offset =  88, len = 16, type = "u64" },
+  { name = "buy_algo_indicator",   offset = 104, len =  1, type = "u8", values = [0, 1, 2, 3] },
+  { name = "buy_client_identity",  offset = 105, len =  1, type = "u8", values = [1, 2, 3] },
+  { name = "sell_order_number",    offset = 106, len = 16, type = "u64" },
+  { name = "sell_algo_indicator",  offset = 122, len =  1, type = "u8", values = [0, 1, 2, 3] },
+  { name = "sell_client_identity", offset = 123, len =  1, type = "u8", values = [1, 2, 3] },
+]
+
+[[version]]
+spec_version  = "1.1"
+valid_from    = 2007-12-24
+valid_to      = 2020-09-04
+record_length = 123
+verified      = false
+fields = [
+  { name = "record_indicator",     offset =   0, len =  2, type = "str", values = ["RM"] },
+  { name = "segment",              offset =   2, len =  4, type = "str", pad = "right", values = ["FAO"] },
+  { name = "trade_number",         offset =   6, len = 16, type = "u64", doc = "16 bytes until 2020-09-04" },
+  { name = "txn_time",             offset =  22, len = 14, type = "jiffies" },
+  { name = "symbol",               offset =  36, len = 10, type = "str", pad = "left" },
+  { name = "instrument",           offset =  46, len =  6, type = "str", values = ["FUTIDX", "OPTIDX", "FUTSTK", "OPTSTK"] },
+  { name = "expiry_date",          offset =  52, len =  9, type = "date_dmmmy" },
+  { name = "strike_price",         offset =  61, len =  8, type = "price", scale = 2 },
+  { name = "option_type",          offset =  69, len =  2, type = "str", values = ["CA", "PA", "CE", "PE", "FF"] },
+  { name = "trade_price",          offset =  71, len =  8, type = "price", scale = 2 },
+  { name = "trade_quantity",       offset =  79, len =  8, type = "u64" },
+  { name = "buy_order_number",     offset =  87, len = 16, type = "u64" },
+  { name = "buy_algo_indicator",   offset = 103, len =  1, type = "u8", values = [0, 1, 2, 3] },
+  { name = "buy_client_identity",  offset = 104, len =  1, type = "u8", values = [1, 2, 3] },
+  { name = "sell_order_number",    offset = 105, len = 16, type = "u64" },
+  { name = "sell_algo_indicator",  offset = 121, len =  1, type = "u8", values = [0, 1, 2, 3] },
+  { name = "sell_client_identity", offset = 122, len =  1, type = "u8", values = [1, 2, 3] },
+]

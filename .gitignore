@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+*.so
+*.pyd
+
+# Data - never commit NSE data, it is licensed and enormous
+data/
+*.DAT
+*.DAT.gz
+*.parquet
+!tests/golden/**/*.parquet
+
+# Tooling
+.tmp/
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/

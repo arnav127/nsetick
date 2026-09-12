@@ -1,0 +1,32 @@
+# NSE Capital Market — Index snapshot records (one per second).
+# Source of truth: "Historical Data Orders and Trade Layout" v1.10 (27 Jul 2022), section 1.3.
+# Note: this layout is absent from both ProjectCourse and BlockCrosser.
+#
+# SPEC DISCREPANCY: the PDF's field table lists lengths 2+4+8+8+8+8 = 38 bytes, but its
+# "Total Length" cell says 24. 24 is not consistent with any prefix of the field list, so
+# it is treated as a documentation error and 38 is used. Flagged unverified: no
+# CASH_Index_*.DAT.gz sample is available locally to confirm against.
+
+[layout]
+id          = "cm_index"
+segment     = "CM"
+kind        = "index"
+description = "Equity Market Index Data — Nifty 50 and Nifty Next 50, sampled every second"
+delimiter   = "LF"
+file_glob   = "CASH_Index_{date}*.DAT.gz"
+split_files = false
+
+[[version]]
+spec_version  = "1.0"
+valid_from    = 2007-12-24
+valid_to      = 9999-12-31
+record_length = 38
+verified      = false
+fields = [
+  { name = "record_indicator",  offset =  0, len = 2, type = "str", values = ["IX"] },
+  { name = "segment",           offset =  2, len = 4, type = "str", values = ["CASH"] },
+  { name = "txn_date",          offset =  6, len = 8, type = "date_ymd", doc = "YYYYMMDD" },
+  { name = "txn_time_hms",      offset = 14, len = 8, type = "time_hms", doc = "HH:MM:SS" },
+  { name = "nifty_50",          offset = 22, len = 8, type = "price", scale = 2 },
+  { name = "nifty_next_50",     offset = 30, len = 8, type = "price", scale = 2 },
+]
