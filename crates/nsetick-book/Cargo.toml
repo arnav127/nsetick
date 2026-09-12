@@ -1,22 +1,16 @@
 [package]
-name = "nsetick-cli"
-description = "Command line interface for nsetick"
+name = "nsetick-book"
+description = "Limit order book reconstruction and L2 snapshots for NSE order-level data"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[[bin]]
-name = "nsetick"
-path = "src/main.rs"
-
 [dependencies]
 anyhow.workspace = true
-arrow = { version = "59.3.0", default-features = false }
-chrono.workspace = true
-clap = { version = "4.6.6", features = ["derive"] }
-mimalloc = "0.1.52"
 nsetick-core.workspace = true
 nsetick-io.workspace = true
-nsetick-book.workspace = true
+chrono.workspace = true
+arrow = { version = "59.3.0", default-features = false }
+crossbeam-channel = "0.5.17"
 parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }

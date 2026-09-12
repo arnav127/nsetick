@@ -39,6 +39,7 @@ from ._native import (
     probe,
     run_spec,
 )
+from ._native import build_books as _native_build_books
 from ._native import parse as _native_parse
 from ._native import version as _native_version
 
@@ -51,6 +52,7 @@ __all__ = [
     "BatchReader",
     "check_filter",
     "describe",
+    "build_books",
     "iter_batches",
     "layouts",
     "memory_estimate",
@@ -106,6 +108,48 @@ def parse(
         max_records=max_records,
         row_group_rows=row_group_rows,
         note=note,
+    )
+
+
+def build_books(
+    input: str,
+    out: str,
+    *,
+    date: str | None = None,
+    where: str | None = None,
+    interval_secs: float = 1.0,
+    levels: int = 5,
+    threads: int | None = None,
+    compression: str = "zstd",
+    max_records: int | None = None,
+    symbols: Sequence[str] | None = None,
+) -> dict:
+    """Reconstruct limit order books and write periodic L2 snapshots as Parquet.
+
+    ``input`` may be a raw ``.DAT.gz`` or a directory of already-parsed orders (the
+    ``date=...`` directory holding ``symbol=*`` partitions). Prefer the parsed directory when
+    it exists: it avoids a second pass over the compressed file and parallelises per symbol,
+    which measured 28x faster on a full session for identical output.
+
+    Replays NSE order events into a per-symbol book - honouring disclosed-quantity
+    replenishment and the queue-priority loss that comes with it - and captures the book
+    every ``interval_secs``. Output is partitioned by symbol, with ``levels`` price levels per
+    side plus the hidden quantity resting at each.
+
+    Every symbol's book is independent, so the replay fans out across ``threads`` and covers
+    the whole session in a single pass over the file.
+    """
+    return _native_build_books(
+        input,
+        out,
+        date=date,
+        where_=where,
+        interval_secs=interval_secs,
+        levels=levels,
+        threads=threads,
+        compression=compression,
+        max_records=max_records,
+        symbols=list(symbols) if symbols is not None else None,
     )
 
 
