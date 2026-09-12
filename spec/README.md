@@ -103,7 +103,7 @@ files from 2020-12-01. nsetick can verify against these rather than merely skipp
 
 `verified = false` on a layout version means it is transcribed from the PDF but has not yet
 been checked against a real file, because no such file was available locally. Currently: all
-CD layouts, `cm_index`, and the pre-changeover FAO variants.
+CD layouts and the pre-changeover FAO and CD variants.
 
 `fao_orders@1.7` and `fao_trades@1.2` have now been confirmed against real April 2022 files.
 The checks that settle it, on `FAO_Trades_28042022_01.DAT.gz`:
@@ -120,5 +120,6 @@ The checks that settle it, on `FAO_Trades_28042022_01.DAT.gz`:
 On the orders side `limit_price_ind` decodes as a clean Y/N and `segment` arrives as `FAOb`,
 confirming the spec-1.7 112-byte record and the trailing-pad handling.
 
-`cm_index` additionally carries a **spec contradiction**: its field lengths sum to 38 bytes
-but the document's "Total Length" cell says 24. 38 is used; see the file's header comment.
+`cm_index` carried a **spec contradiction**: field lengths summing to 38 bytes against a
+"Total Length" cell of 24. Real files settle it at 38, and the decoded values are right
+(Nifty 50 at 17,437.80 for the 2022-04-01 open), so the document's total is an error.

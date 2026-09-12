@@ -1,0 +1,28 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "nsetick"
+description = "Fast, correct parsing of NSE historical order and trade data"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+readme = "README.md"
+dependencies = ["pyarrow>=14"]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+pandas = ["pandas>=2.0"]
+polars = ["polars>=0.20"]
+
+[project.urls]
+Repository = "https://github.com/arnav127/nsetick"
+
+[tool.maturin]
+manifest-path = "crates/nsetick-py/Cargo.toml"
+module-name = "nsetick._native"
+python-source = "python"
+features = ["pyo3/extension-module"]
+# The layout specs ship inside the wheel so the pure-Python reference decoder works from an
+# installed package, not only from a source checkout.
+include = [{ path = "spec/layouts/*.toml", format = ["sdist", "wheel"] }]
