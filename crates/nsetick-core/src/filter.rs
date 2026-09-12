@@ -88,6 +88,19 @@ pub enum Predicate {
 
     /// A single-byte Y/N flag.
     FlagIs { offset: usize, want: bool },
+
+    /// Comparison between two numeric fields of the same record.
+    ///
+    /// This is what lets a derived condition be pushed down rather than computed after
+    /// decoding: `volume_original > volume_disclosed` identifies iceberg orders without ever
+    /// building a column for the rows that fail it.
+    FieldCmp {
+        left_offset: usize,
+        left_len: usize,
+        right_offset: usize,
+        right_len: usize,
+        op: CmpOp,
+    },
 }
 
 impl Predicate {
@@ -145,6 +158,22 @@ impl Predicate {
             Predicate::FlagIs { offset, want } => {
                 let b = record[*offset];
                 (b == b'Y') == *want && (b == b'Y' || b == b'N')
+            }
+
+            Predicate::FieldCmp {
+                left_offset,
+                left_len,
+                right_offset,
+                right_len,
+                op,
+            } => {
+                let l = parse_u64(&record[*left_offset..*left_offset + *left_len]);
+                let r = parse_u64(&record[*right_offset..*right_offset + *right_len]);
+                match (l, r) {
+                    // A null on either side compares false, as in SQL.
+                    (Some(a), Some(b)) => op.matches(a.cmp(&b)),
+                    _ => false,
+                }
             }
         }
     }
@@ -401,11 +430,55 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Compare two numeric fields of the same record.
+    fn field_comparison(&self, left: &Field, right: &Field, op: CmpOp) -> Result<Predicate> {
+        let numeric = |f: &Field| {
+            matches!(
+                f.ty,
+                FieldType::U8 | FieldType::U64 | FieldType::Price | FieldType::Jiffies
+            )
+        };
+        for f in [left, right] {
+            if !numeric(f) {
+                bail!(
+                    "field-to-field comparison needs numeric fields, but {} is {:?}",
+                    f.name,
+                    f.ty
+                );
+            }
+        }
+        // Comparing paise against a share count, or two different price scales, is almost
+        // certainly a mistake rather than an intention.
+        if left.scale != right.scale {
+            bail!(
+                "cannot compare {} and {}: they have different scales ({:?} and {:?}), so the comparison would be between different units",
+                left.name,
+                right.name,
+                left.scale,
+                right.scale
+            );
+        }
+        Ok(Predicate::FieldCmp {
+            left_offset: left.offset,
+            left_len: left.len,
+            right_offset: right.offset,
+            right_len: right.len,
+            op,
+        })
+    }
+
     fn binary_comparison(&mut self, field: &Field) -> Result<Predicate> {
         let op = match self.next() {
             Some(Tok::Op(o)) => o,
             other => bail!("expected a comparison operator after {}, found {other:?}", field.name),
         };
+
+        // A bare identifier on the right means a field-to-field comparison.
+        if let Some(Tok::Ident(name)) = self.peek().cloned() {
+            self.pos += 1;
+            let right = self.field(&name)?;
+            return self.field_comparison(field, right, op);
+        }
 
         match self.next() {
             Some(Tok::Str(s)) => match field.ty {
@@ -494,12 +567,19 @@ impl<'a> Parser<'a> {
 /// ```text
 ///   series == 'EQ'
 ///   series == 'EQ' and symbol in ('RELIANCE', 'TCS', 'M&M')
-///   activity_type == 1 and volume_original > volume_disclosed  -- not supported: see below
+///   activity_type == 1 and volume_original > volume_disclosed
 ///   not (mkt_order_flag == true) and txn_time >= '09:15:00' and txn_time < '15:30:00'
 /// ```
 ///
-/// Field-to-field comparison is deliberately absent; it would not be expressible as a
-/// constant-folded byte test. Derive such columns after decoding instead.
+/// Two numeric fields of the same record can be compared directly, which is how a derived
+/// condition gets pushed down instead of being computed after decoding:
+///
+/// ```text
+///   volume_original > volume_disclosed and volume_disclosed > 0    -- iceberg orders
+/// ```
+///
+/// Both sides must be numeric and share a scale, so comparing a price against a share count
+/// is rejected rather than silently comparing different units.
 pub fn compile(expr: &str, version: &Version, session_date: Option<NaiveDate>) -> Result<Predicate> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
@@ -608,6 +688,56 @@ mod tests {
             "(symbol == 'BCG' or symbol == 'BALKRISIND') and activity_type == 1",
             BCG
         ));
+    }
+
+    #[test]
+    fn two_numeric_fields_can_be_compared() {
+        // The iceberg condition, pushed down instead of computed after decoding.
+        // BALKRISIND: volume_disclosed 0, volume_original 76. BCG: 0 and 75.
+        assert!(check("volume_original > volume_disclosed", BALKRISIND));
+        assert!(!check("volume_disclosed > volume_original", BALKRISIND));
+        assert!(check("volume_original >= volume_original", BALKRISIND));
+        assert!(check("limit_price > trigger_price", BALKRISIND)); // 230000 vs 0, both paise
+        // Neither sample is an iceberg: disclosed quantity is 0 for both.
+        assert!(!check(
+            "volume_original > volume_disclosed and volume_disclosed > 0",
+            BALKRISIND
+        ));
+        assert!(!check(
+            "volume_original > volume_disclosed and volume_disclosed > 0",
+            BCG
+        ));
+    }
+
+    #[test]
+    fn comparing_fields_of_different_scales_is_refused() {
+        let v = cm_orders();
+        // limit_price is scale 2 (paise); volume_original is a share count.
+        let err = format!(
+            "{:#}",
+            compile("limit_price > volume_original", &v, None).unwrap_err()
+        );
+        assert!(err.contains("different scales"), "{err}");
+    }
+
+    #[test]
+    fn comparing_a_text_field_to_a_field_is_refused() {
+        let v = cm_orders();
+        let err = format!(
+            "{:#}",
+            compile("symbol > series", &v, None).unwrap_err()
+        );
+        assert!(err.contains("numeric"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_field_on_the_right_is_caught() {
+        let v = cm_orders();
+        let err = format!(
+            "{:#}",
+            compile("volume_original > volume_disclsoed", &v, None).unwrap_err()
+        );
+        assert!(err.contains("unknown field"), "{err}");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # NSE Capital Market — Index snapshot records (one per second).
 # Source of truth: "Historical Data Orders and Trade Layout" v1.10 (27 Jul 2022), section 1.3.
-# Note: this layout is absent from both ProjectCourse and BlockCrosser.
+# Note: this layout is commonly overlooked; most NSE tooling handles only orders and trades.
 #
 # SPEC DISCREPANCY, now settled: the PDF's field table lists lengths 2+4+8+8+8+8 = 38 bytes
 # but its "Total Length" cell says 24. Real files confirm 38 (39 including the LF), so the

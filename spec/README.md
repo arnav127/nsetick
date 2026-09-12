@@ -99,6 +99,11 @@ Note also that records continue past the 15:30 close to about 15:59, so a naive
 Each `.DAT.gz` has a sibling `.DAT.gz.trg` containing an MD5 and a byte count, available for
 files from 2020-12-01. nsetick can verify against these rather than merely skipping them.
 
+### Records continue past the close
+
+Order and trade records run to roughly 15:59, not 15:30, so a naive "market hours" filter of
+09:15 to 15:30 discards real data.
+
 ### Unverified layouts
 
 `verified = false` on a layout version means it is transcribed from the PDF but has not yet

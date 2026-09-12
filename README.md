@@ -141,9 +141,20 @@ expr       := or_expr
 or_expr    := and_expr ('or' and_expr)*
 and_expr   := unary ('and' unary)*
 unary      := 'not' unary | '(' expr ')' | comparison
-comparison := field op literal | field ['not'] 'in' '(' literal, ... ')'
+comparison := field op literal
+            | field op field
+            | field ['not'] 'in' '(' literal, ... ')'
 op         := '==' | '=' | '!=' | '<' | '<=' | '>' | '>='
 ```
+
+Two numeric fields of the same record can be compared, which pushes a derived condition down
+into the scan instead of computing it afterwards:
+
+```
+series == 'EQ' and volume_original > volume_disclosed and volume_disclosed > 0
+```
+
+Both sides must share a scale, so a price cannot be silently compared against a share count.
 
 Filters compile to byte comparisons at resolved offsets and run before any column is built,
 so a rejected record costs almost nothing. Field names are checked at compile time: a typo is
