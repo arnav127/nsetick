@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+arrow = { version = "59.3.0", default-features = false }
 chrono.workspace = true
 serde.workspace = true
 toml.workspace = true
