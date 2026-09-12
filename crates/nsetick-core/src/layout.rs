@@ -28,8 +28,16 @@ const EMBEDDED: &[(&str, &str)] = &[
 pub const PAD_BYTES: &[u8] = b"b ";
 
 #[inline]
-fn is_pad(b: u8) -> bool {
+pub fn is_pad(b: u8) -> bool {
     b == b'b' || b == b' '
+}
+
+/// Strip leading pad bytes. Used by every numeric parse, since NSE zero-fills numbers but
+/// pad-fills the fields that may be blank.
+#[inline]
+pub fn unpad_left(raw: &[u8]) -> &[u8] {
+    let i = raw.iter().position(|b| !is_pad(*b)).unwrap_or(raw.len());
+    &raw[i..]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
