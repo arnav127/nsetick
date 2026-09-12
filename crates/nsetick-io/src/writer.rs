@@ -31,7 +31,7 @@ use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use parquet::basic::{Compression, ZstdLevel};
+use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use crate::memory::MemoryGuard;
@@ -59,7 +59,9 @@ pub struct WriterOptions {
 impl Default for WriterOptions {
     fn default() -> Self {
         Self {
-            compression: Compression::ZSTD(ZstdLevel::try_new(3).expect("level 3 is valid")),
+            // Snappy by default: it decompresses several times faster than zstd, and
+            // these files are read far more often than they are written.
+            compression: Compression::SNAPPY,
             row_group_rows: 256_000,
             max_buffered_bytes: 256 * 1024 * 1024,
             data_page_size: 64 * 1024,

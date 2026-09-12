@@ -106,7 +106,7 @@ struct ParseArgs {
     #[arg(long, default_value = "symbol")]
     partition_by: String,
 
-    #[arg(long, value_enum, default_value_t = CompressionArg::Zstd)]
+    #[arg(long, value_enum, default_value_t = CompressionArg::Snappy)]
     compression: CompressionArg,
 
     /// Target rows per row group.
@@ -201,14 +201,15 @@ struct BookArgs {
     #[arg(long, default_value_t = 1.0)]
     interval: f64,
 
-    /// Depth captured per side.
-    #[arg(long, default_value_t = 5)]
+    /// Depth captured per side. 20 covers most of the resting book on a liquid name; 5
+    /// sees only the front of the queue.
+    #[arg(long, default_value_t = 20)]
     levels: usize,
 
     #[arg(long, short = 'j')]
     threads: Option<usize>,
 
-    #[arg(long, value_enum, default_value_t = CompressionArg::Zstd)]
+    #[arg(long, value_enum, default_value_t = CompressionArg::Snappy)]
     compression: CompressionArg,
 
     /// Stop after roughly this many records. For smoke tests.

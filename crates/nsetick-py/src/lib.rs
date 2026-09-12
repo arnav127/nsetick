@@ -75,7 +75,7 @@ fn stats_dict<'py>(py: Python<'py>, s: &Stats) -> PyResult<Bound<'py, PyDict>> {
 #[pyfunction]
 #[pyo3(signature = (
     input, out, *, layout=None, date=None, select=None, where_=None,
-    partition_by="symbol", compression="zstd", threads=None, strict=true,
+    partition_by="symbol", compression="snappy", threads=None, strict=true,
     verify_trigger=true, memory_limit_mb=None, max_records=None, row_group_rows=None,
     note=None,
 ))]
@@ -318,8 +318,8 @@ impl BatchReader {
 /// session in one pass over the file rather than one pass per symbol.
 #[pyfunction]
 #[pyo3(signature = (
-    input, out, *, date=None, where_=None, interval_secs=1.0, levels=5, threads=None,
-    compression="zstd", max_records=None, symbols=None,
+    input, out, *, date=None, where_=None, interval_secs=1.0, levels=20, threads=None,
+    compression="snappy", max_records=None, symbols=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_books(
