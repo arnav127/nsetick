@@ -3,7 +3,7 @@
 Tests needing a real NSE file are skipped unless NSETICK_TEST_FILE points at one, so the
 suite still runs on a machine without the data.
 
-    set NSETICK_TEST_FILE=C:\\sandbox\\ProjectCourse\\data\\raw\\CASH_Orders_27012022.DAT.gz
+    set NSETICK_TEST_FILE=/path/to/CASH_Orders_27012022.DAT.gz
     pytest python/tests
 """
 

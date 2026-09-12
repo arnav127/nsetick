@@ -158,73 +158,85 @@ m["estimated_bytes"]       # ~7.1 GB for 2000 symbol partitions
 
 * **Volumes are shares** in CM and FAO, and **lots** in CD.
 
-## Migrating the existing projects
+## Derived features: where to compute them
 
-### BlockCrosser (`stage1_data/duckdb_parser.py`)
+Short answer: **compute features in Python; push *filters* into nsetick.** That split is
+where the speed is, and it is measured, not assumed. Same 8,000,000-record fixture.
 
-The whole module reduces to one call. Replace `parse_cash_file(...)` with:
+### A row-wise derived column is essentially free in Python
 
-```python
-import nsetick
+`is_iceberg` is the canonical example: `volume_original > volume_disclosed and
+volume_disclosed > 0`.
 
-def parse_cash_file(date_str, category, symbols=None, all_universe=True, force_reparse=False):
-    prefix = "CASH_Orders" if category == "cash_orders" else "CASH_Trades"
-    src = next(RAW_DATA_DIR.glob(f"{prefix}_{date_str}*.DAT.gz"))
+| | time | overhead |
+|---|---|---|
+| stream and decode, no derived column | 2.68 s | baseline |
+| + `is_iceberg` via Arrow compute | 2.84 s | +6.0% |
+| + `is_iceberg` via Polars | 2.83 s | +5.9% |
 
-    where = "series == 'EQ'"
-    if not all_universe and symbols:
-        quoted = ", ".join(f"'{s}'" for s in symbols)
-        where += f" and symbol in ({quoted})"
+A vectorised boolean over an Arrow array runs at hundreds of millions of elements per second,
+while decoding runs at a few million rows per second. The derived column is roughly 6% of the
+work. Moving that into the parser could not win back more than those 6%, and you would be
+reimplementing what Arrow and Polars already do well.
 
-    return nsetick.parse(src, out=PARSED_DATA_DIR, where=where, note=f"stage1 {category}")
-```
+### Filtering on a derived value *is* worth pushing down
 
-Two behaviour changes worth knowing:
+The difference is between *computing* a value and *using it to reject rows*. A predicate
+evaluated on raw bytes rejects a record before any column is built for it:
 
-* The output is partitioned by symbol (`symbol=RELIANCE/part-000.parquet`) rather than one
-  flat file per date. Reading is unchanged if you use
-  `read_parquet('root/**/*.parquet', hive_partitioning=1)`; each symbol's rows are already
-  sorted by `txn_time`, so the CLOB replay no longer needs its own sort.
-* `is_iceberg` is **not** computed by nsetick. It is business logic, and belongs in
-  BlockCrosser. It is one expression over columns you already have:
+| | time | rows |
+|---|---|---|
+| decode all EQ rows, filter icebergs in Python | 2.69 s | 1,416,691 |
+| `where="... and volume_original > volume_disclosed and volume_disclosed > 0"` | **2.15 s** | 1,416,691 |
 
-  ```python
-  df["is_iceberg"] = (df["volume_original"] > df["volume_disclosed"]) & (df["volume_disclosed"] > 0)
-  ```
-
-`LTRIM(TRIM(symbol), 'b ')` is no longer needed; padding is handled by the layout.
-
-### ProjectCourse (`stage1_parse/duckdb_parser.py`)
+1.25x, with identical output. The gain is bounded by gzip decompression, which still has to
+read every record either way; what it saves is building columns for the 82% of rows that are
+discarded. The more selective the condition and the wider the projection, the more it saves.
 
 ```python
-import nsetick
-from config.settings import TARGET_SYMBOLS, PARSED_DATA_DIR, RAW_DATA_DIR
-
-def run_parser_for_date(date_str):
-    symbols = ", ".join(f"'{s}'" for s in TARGET_SYMBOLS)
-    jobs = [
-        ("CASH_Orders", f"series == 'EQ' and symbol in ({symbols})"),
-        ("CASH_Trades", f"series == 'EQ' and symbol in ({symbols})"),
-        ("FAO_Orders",  f"instrument == 'FUTSTK' and symbol in ({symbols})"),
-        ("FAO_Trades",  f"instrument == 'FUTSTK' and symbol in ({symbols})"),
-    ]
-    for prefix, where in jobs:
-        for src in sorted(RAW_DATA_DIR.glob(f"{prefix}_{date_str}*.DAT.gz")):
-            nsetick.parse(src, out=PARSED_DATA_DIR, where=where)
+# Two fields of the same record can be compared directly.
+icebergs = nsetick.read_table(
+    path,
+    where="series == 'EQ' and volume_original > volume_disclosed and volume_disclosed > 0",
+    select=["symbol", "txn_time", "limit_price", "volume_original", "volume_disclosed"],
+)
 ```
 
-Note `glob` rather than a single file: FAO arrives split into `_01 ... _nn` parts.
+Both sides must be numeric and share a scale, so comparing a price against a share count is
+rejected rather than silently comparing paise to quantities.
 
-Three correctness fixes come for free:
+### Stateful features belong in Polars
 
-* `REGEXP_EXTRACT(symbol, '[A-Z0-9-]+')` silently truncated `M&M` to `M` and `COX&KINGS` to
-  `COX`. Only the ten-symbol universe hid this; widening it would have corrupted data.
-* The 0-based schema offsets and 1-based SQL `SUBSTRING` positions were maintained separately
-  and drifted. Offsets now exist once.
-* `TRY_CAST` turned malformed records into rows of NULLs. nsetick stops instead, and always
-  reports `rows_malformed`.
+OFI, running sums, rolling means and lagged differences need an ordered series per symbol.
+On 800,575 rows already in memory:
 
-`TARGET_SYMBOLS_RAW` with its hand-written leading spaces can go; filters take bare symbols.
+| | time |
+|---|---|
+| nsetick read (scans 8M records, keeps 800,575) | 2.00 s |
+| Polars: sort + signed volume + `cum_sum` + `rolling_mean` + `diff` | **0.21 s** |
+
+The whole feature pipeline is 10% of the read. And because nsetick partitions by symbol and
+each partition is already in time order, the sort is usually unnecessary.
+
+```python
+import polars as pl
+
+df = pl.from_arrow(nsetick.read_table(path, where="symbol == 'RELIANCE'", select=[...]))
+qty = pl.col("volume_original").cast(pl.Int64)          # u64 has no negation
+df = df.with_columns(
+    signed=pl.when(pl.col("buy_sell") == "B").then(qty).otherwise(-qty)
+).with_columns(
+    ofi=pl.col("signed").cum_sum(),
+    roll=pl.col("limit_price").rolling_mean(window_size=100),
+)
+```
+
+### The rule
+
+nsetick decides **which rows and which columns**. Your code decides **what to compute from
+them**. Anything that changes the row count belongs in `where=`; anything that adds a column
+belongs downstream. Keeping domain logic out of the parser is also what lets one parser serve
+unrelated analyses without accumulating each one's definitions.
 
 ## Reference decoder
 

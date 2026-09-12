@@ -1,7 +1,7 @@
 """Structural validation of the nsetick layout specs.
 
 Every bug this guards against was observed in the wild:
-  * offsets typed twice and drifting out of sync (ProjectCourse sym_pos 37 vs 36)
+  * the same offset typed in two places and drifting out of sync
   * a field list whose lengths do not sum to the declared record length
   * 0-based schema offsets mixed with 1-based SQL SUBSTRING positions
   * two repos disagreeing on a field name for the same byte range
