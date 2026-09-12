@@ -45,6 +45,8 @@ enum Command {
         #[arg(long)]
         date: Option<String>,
     },
+    /// Reconstruct limit order books and write periodic L2 snapshots.
+    Book(BookArgs),
     /// Run one or more parses described by a JSON spec file.
     Run {
         /// Path to the JSON run spec.
@@ -169,6 +171,152 @@ fn resolve_date(explicit: &Option<String>, path: &Path) -> Result<NaiveDate> {
             path.file_name().unwrap_or_default()
         )
     })
+}
+
+#[derive(Args)]
+struct BookArgs {
+    /// Either a raw CASH_Orders .DAT.gz, or a directory of already-parsed orders (the
+    /// date=... directory holding symbol=* partitions). Parsed input is preferred when it
+    /// exists: it avoids a second pass over the compressed file and parallelises per symbol.
+    input: PathBuf,
+
+    /// Output root directory.
+    #[arg(long, short)]
+    out: PathBuf,
+
+    /// Session date as YYYY-MM-DD. Inferred from the file name when omitted, and required
+    /// for parsed input whose directory name does not carry it.
+    #[arg(long)]
+    date: Option<String>,
+
+    /// Restrict to these symbols when replaying parsed input.
+    #[arg(long, value_delimiter = ',')]
+    symbols: Option<Vec<String>>,
+
+    /// Filter applied before decoding raw input, e.g. "series == 'EQ'".
+    #[arg(long = "where", default_value = "series == 'EQ'")]
+    filter: String,
+
+    /// Seconds between snapshots.
+    #[arg(long, default_value_t = 1.0)]
+    interval: f64,
+
+    /// Depth captured per side.
+    #[arg(long, default_value_t = 5)]
+    levels: usize,
+
+    #[arg(long, short = 'j')]
+    threads: Option<usize>,
+
+    #[arg(long, value_enum, default_value_t = CompressionArg::Zstd)]
+    compression: CompressionArg,
+
+    /// Stop after roughly this many records. For smoke tests.
+    #[arg(long)]
+    max_records: Option<u64>,
+}
+
+/// Pull DDMMYYYY or YYYY-MM-DD out of a `date=...` directory name.
+fn date_from_dir(path: &Path) -> Option<NaiveDate> {
+    let name = path.file_name()?.to_str()?;
+    let v = name.strip_prefix("date=")?;
+    NaiveDate::parse_from_str(v, "%Y-%m-%d")
+        .ok()
+        .or_else(|| NaiveDate::parse_from_str(v, "%d%m%Y").ok())
+}
+
+fn cmd_book(args: BookArgs) -> Result<()> {
+    let compression = match args.compression {
+        CompressionArg::Zstd => parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3).expect("level 3 is valid"),
+        ),
+        CompressionArg::Snappy => parquet::basic::Compression::SNAPPY,
+        CompressionArg::None => parquet::basic::Compression::UNCOMPRESSED,
+    };
+
+    // Parsed input is a directory; raw input is a file.
+    if args.input.is_dir() {
+        let date = match &args.date {
+            Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .with_context(|| format!("parsing --date {s:?}"))?,
+            None => date_from_dir(&args.input).with_context(|| {
+                format!(
+                    "cannot infer a session date from {:?}; pass --date YYYY-MM-DD",
+                    args.input.file_name().unwrap_or_default()
+                )
+            })?,
+        };
+        let mut req =
+            nsetick_book::ParquetReplayRequest::new(&args.input, &args.out, date);
+        req.interval_secs = args.interval;
+        req.levels = args.levels;
+        req.threads = args.threads;
+        req.symbols = args.symbols.clone().unwrap_or_default();
+        req.writer = WriterOptions {
+            compression,
+            ..WriterOptions::default()
+        };
+        eprintln!(
+            "nsetick book: {} (parsed) -> {}
+  session {} | every {}s | {} levels",
+            args.input.display(),
+            args.out.display(),
+            date,
+            args.interval,
+            args.levels
+        );
+        let r = nsetick_book::from_parquet::run(&req)?;
+        print_book_report(&r);
+        return Ok(());
+    }
+
+    let date = resolve_date(&args.date, &args.input)?;
+    let mut req = nsetick_book::ReplayRequest::new(&args.input, &args.out, date);
+    req.filter = args.filter.clone();
+    req.interval_secs = args.interval;
+    req.levels = args.levels;
+    req.threads = args.threads;
+    req.max_records = args.max_records;
+    req.writer = WriterOptions {
+        compression,
+        ..WriterOptions::default()
+    };
+
+    eprintln!(
+        "nsetick book: {} (raw) -> {}
+  session {} | every {}s | {} levels | where {:?}",
+        args.input.display(),
+        args.out.display(),
+        date,
+        args.interval,
+        args.levels,
+        args.filter
+    );
+
+    let r = nsetick_book::replay::run(&req)?;
+    print_book_report(&r);
+    Ok(())
+}
+
+fn print_book_report(r: &nsetick_book::ReplayReport) {
+    println!("rows read         {}", r.stats.rows_read);
+    println!("events applied    {}", r.events_applied);
+    println!("symbols           {}", r.symbols);
+    println!("snapshots         {}", r.snapshots);
+    println!("fills generated   {}", r.fills_generated);
+    println!("replenishments    {}", r.replenishments);
+    if r.crossed_symbols > 0 {
+        println!(
+            "crossed books     {}  <-- replay diverged from the exchange for these symbols",
+            r.crossed_symbols
+        );
+    }
+    println!("threads           {}", r.threads);
+    println!(
+        "elapsed           {:.1}s  ({:.2} M events/s)",
+        r.elapsed_secs,
+        r.events_per_sec() / 1e6
+    );
 }
 
 fn human_bytes(n: u64) -> String {
@@ -408,6 +556,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Parse(args) => cmd_parse(args),
+        Command::Book(args) => cmd_book(args),
         Command::Run { spec, dry_run } => cmd_run(&spec, dry_run),
         Command::Layouts => cmd_layouts(),
         Command::Describe { layout, date } => cmd_describe(&layout, date),

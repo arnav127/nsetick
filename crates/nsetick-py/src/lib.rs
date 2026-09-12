@@ -312,6 +312,117 @@ impl BatchReader {
     }
 }
 
+/// Reconstruct limit order books and write periodic L2 snapshots.
+///
+/// Every symbol's book is independent, so this fans out across threads and replays the whole
+/// session in one pass over the file rather than one pass per symbol.
+#[pyfunction]
+#[pyo3(signature = (
+    input, out, *, date=None, where_=None, interval_secs=1.0, levels=5, threads=None,
+    compression="zstd", max_records=None, symbols=None,
+))]
+#[allow(clippy::too_many_arguments)]
+fn build_books(
+    py: Python<'_>,
+    input: PathBuf,
+    out: PathBuf,
+    date: Option<&str>,
+    where_: Option<&str>,
+    interval_secs: f64,
+    levels: usize,
+    threads: Option<usize>,
+    compression: &str,
+    max_records: Option<u64>,
+    symbols: Option<Vec<String>>,
+) -> PyResult<Py<PyDict>> {
+    let compression = match compression.to_ascii_lowercase().as_str() {
+        "zstd" => parquet_zstd(),
+        "snappy" => parquet::basic::Compression::SNAPPY,
+        "none" | "uncompressed" => parquet::basic::Compression::UNCOMPRESSED,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown compression {other:?}; use zstd, snappy or none"
+            )))
+        }
+    };
+
+    // A directory means already-parsed orders, which replay far faster: no second pass over
+    // the compressed file, and one parallel job per symbol partition.
+    if input.is_dir() {
+        let session = match date {
+            Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
+                PyValueError::new_err(format!("date {s:?} is not YYYY-MM-DD: {e}"))
+            })?,
+            None => input
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("date="))
+                .and_then(|v| {
+                    NaiveDate::parse_from_str(v, "%Y-%m-%d")
+                        .ok()
+                        .or_else(|| NaiveDate::parse_from_str(v, "%d%m%Y").ok())
+                })
+                .ok_or_else(|| {
+                    PyValueError::new_err(
+                        "cannot infer a session date from the directory name; pass date=",
+                    )
+                })?,
+        };
+        let mut req = nsetick_book::ParquetReplayRequest::new(&input, &out, session);
+        req.interval_secs = interval_secs;
+        req.levels = levels;
+        req.threads = threads;
+        req.symbols = symbols.unwrap_or_default();
+        req.writer = WriterOptions {
+            compression,
+            ..WriterOptions::default()
+        };
+        let r = py
+            .detach(|| nsetick_book::from_parquet::run(&req))
+            .map_err(to_py_err)?;
+        return book_report(py, &r, "parquet");
+    }
+
+    let session = resolve_date(date, &input)?;
+    let mut req = nsetick_book::ReplayRequest::new(&input, &out, session);
+    if let Some(w) = where_ {
+        req.filter = w.to_string();
+    }
+    req.interval_secs = interval_secs;
+    req.levels = levels;
+    req.threads = threads;
+    req.max_records = max_records;
+    req.writer = WriterOptions {
+        compression,
+        ..WriterOptions::default()
+    };
+
+    let r = py
+        .detach(|| nsetick_book::replay::run(&req))
+        .map_err(to_py_err)?;
+    book_report(py, &r, "raw")
+}
+
+fn book_report(
+    py: Python<'_>,
+    r: &nsetick_book::ReplayReport,
+    source: &str,
+) -> PyResult<Py<PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("source", source)?;
+    d.set_item("rows_read", r.stats.rows_read)?;
+    d.set_item("events_applied", r.events_applied)?;
+    d.set_item("symbols", r.symbols)?;
+    d.set_item("snapshots", r.snapshots)?;
+    d.set_item("fills_generated", r.fills_generated)?;
+    d.set_item("replenishments", r.replenishments)?;
+    d.set_item("crossed_symbols", r.crossed_symbols)?;
+    d.set_item("elapsed_secs", r.elapsed_secs)?;
+    d.set_item("threads", r.threads)?;
+    d.set_item("bytes_decompressed", r.bytes_decompressed)?;
+    Ok(d.into())
+}
+
 /// The layout ids nsetick knows about.
 #[pyfunction]
 fn layouts() -> Vec<&'static str> {
@@ -431,6 +542,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BatchReader>()?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(run_spec, m)?)?;
+    m.add_function(wrap_pyfunction!(build_books, m)?)?;
     m.add_function(wrap_pyfunction!(layouts, m)?)?;
     m.add_function(wrap_pyfunction!(describe, m)?)?;
     m.add_function(wrap_pyfunction!(probe, m)?)?;

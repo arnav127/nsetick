@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nsetick-core", "crates/nsetick-io", "crates/nsetick-cli", "crates/nsetick-py"]
+members = ["crates/nsetick-core", "crates/nsetick-io", "crates/nsetick-cli", "crates/nsetick-py", "crates/nsetick-book"]
 
 [workspace.package]
 version = "0.1.0"
@@ -15,6 +15,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 nsetick-core = { path = "crates/nsetick-core" }
 nsetick-io = { path = "crates/nsetick-io" }
+nsetick-book = { path = "crates/nsetick-book" }
 
 [profile.release]
 opt-level = 3

@@ -777,6 +777,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nsetick-book"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "crossbeam-channel",
+ "nsetick-core",
+ "nsetick-io",
+ "parquet",
+]
+
+[[package]]
 name = "nsetick-cli"
 version = "0.1.0"
 dependencies = [
@@ -785,6 +798,7 @@ dependencies = [
  "chrono",
  "clap",
  "mimalloc",
+ "nsetick-book",
  "nsetick-core",
  "nsetick-io",
  "parquet",
@@ -824,6 +838,7 @@ dependencies = [
  "anyhow",
  "arrow",
  "chrono",
+ "nsetick-book",
  "nsetick-core",
  "nsetick-io",
  "parquet",
