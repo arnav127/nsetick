@@ -301,25 +301,51 @@ impl PartitionedWriter {
         let after = part.in_progress;
 
         self.budget.adjust(before, after);
-        self.enforce_budget()
+
+        // Keep the global budget satisfied by construction, with a per-partition cap, so the
+        // hot path never walks every open partition.
+        //
+        // The previous approach searched all open partitions for the largest whenever the
+        // shared budget was exceeded, and flushed exactly one per search. Once enough
+        // partitions were open to fill the budget - which a full session does and a short
+        // sample does not - that search ran on essentially every write, giving O(partitions)
+        // work per write and O(partitions^2) per chunk. On a 500-symbol session that is
+        // roughly 250,000 scans per chunk, and it is why a full file took three times longer
+        // than its own throughput on a 60M-record slice predicted.
+        if after > self.partition_cap() {
+            self.flush_partition(key)?;
+        }
+        if self.budget.over_buffer_limit() {
+            self.spill_largest()?;
+        }
+        Ok(())
     }
 
-    /// Close row groups on the largest partitions until the shared budget is satisfied.
+    /// Bytes any single partition may hold before its row group is closed.
     ///
-    /// A shard only ever flushes its own partitions. When another shard is holding most of
-    /// the memory this shard runs out of things to flush and gives up; that shard will hit
-    /// the same condition on its next write and flush its own.
-    fn enforce_budget(&mut self) -> Result<()> {
-        while self.budget.over_buffer_limit() {
-            let Some(key) = self
-                .parts
-                .iter()
-                .filter(|(_, p)| p.in_progress > 0)
-                .max_by_key(|(_, p)| p.in_progress)
-                .map(|(k, _)| k.clone())
-            else {
-                break;
-            };
+    /// Dividing the shared allowance by the number of open partitions means the sum cannot
+    /// exceed the allowance, so no global check is needed on the common path. The floor keeps
+    /// row groups worth writing when a session opens thousands of partitions.
+    fn partition_cap(&self) -> usize {
+        const FLOOR: usize = 1024 * 1024;
+        let open = self.parts.len().max(1);
+        (self.budget.buffer_limit() / open).max(FLOOR)
+    }
+
+    /// Safety net for when the shared budget is exceeded anyway, because sibling shards are
+    /// holding memory or the per-partition floor sums above the allowance.
+    ///
+    /// One pass over the open partitions, flushing everything substantial, rather than one
+    /// search per partition flushed.
+    fn spill_largest(&mut self) -> Result<()> {
+        let threshold = (self.partition_cap() / 2).max(64 * 1024);
+        let keys: Vec<String> = self
+            .parts
+            .iter()
+            .filter(|(_, p)| p.in_progress >= threshold)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
             self.flush_partition(&key)?;
         }
         Ok(())
