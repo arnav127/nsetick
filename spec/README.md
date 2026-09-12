@@ -71,6 +71,29 @@ The document lists ~40 series codes. A single 2022 session also contains `E1`, `
 FAO orders and trades arrive as `FAO_Orders_DDMMYYYY_01.DAT.gz` … `_nn.DAT.gz`. Contracts do
 not overlap across the parts, so the parts can be processed independently and concatenated.
 
+### CM files are internally split by symbol range
+
+The layout document says only FAO files are split into streams. In practice a single
+`CASH_Orders_DDMMYYYY.DAT.gz` is a **concatenation of gzip members**, each covering a range of
+symbols and each internally ordered by time across the whole session.
+
+Measured on `CASH_Orders_27012022.DAT.gz` (684,079,700 records, 56 GB decompressed):
+
+* the first 30M records cover 09:00:00 to 10:00:17 but only 625 distinct symbols, spanning
+  `1018GS2026` through `CYIENT`;
+* every individual symbol nevertheless spans the full session, 09:00 to 15:59.
+
+Two consequences:
+
+1. A plain `GzDecoder` stops at the end of the first member and silently returns a fraction
+   of the session with no error. nsetick uses `MultiGzDecoder`.
+2. Each symbol's records are contiguous and in time order, so partitioning the output by
+   symbol produces time-sorted partitions with no sort step. Verified: zero out-of-order rows
+   across all seven symbols in a full-session run.
+
+Note also that records continue past the 15:30 close to about 15:59, so a naive
+"market hours" filter of 09:15-15:30 discards real data.
+
 ### `.trg` trigger files
 
 Each `.DAT.gz` has a sibling `.DAT.gz.trg` containing an MD5 and a byte count, available for
