@@ -307,8 +307,9 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
                     }
                 }
             }));
-            drop(());
         }
+        // Close the originals now that every decoder holds its own clone: the channels only
+        // signal end-of-stream once the last sender or receiver goes away.
         drop(dec_tx);
         drop(chunk_rx);
 

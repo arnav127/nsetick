@@ -16,7 +16,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
