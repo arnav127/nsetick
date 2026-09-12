@@ -18,7 +18,8 @@ def _find_spec_dir() -> Path:
     here = Path(__file__).resolve()
     candidates = [
         here.parents[2] / "spec" / "layouts",   # source checkout: <repo>/spec/layouts
-        here.parent / "spec" / "layouts",       # installed wheel: nsetick/spec/layouts
+        here.parents[1] / "spec" / "layouts",   # installed wheel: site-packages/spec/layouts
+        here.parent / "spec" / "layouts",
         here.parent / "layouts",
     ]
     for c in candidates:

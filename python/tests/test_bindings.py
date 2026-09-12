@@ -143,6 +143,16 @@ def test_parse_and_iter_batches_agree_on_the_filter_keyword():
     assert "where" in inspect.signature(nsetick.iter_batches).parameters
 
 
+def test_bundled_specs_are_findable_from_an_installed_package():
+    # The TOMLs ship in the wheel; if the lookup path is wrong they resolve to nothing and
+    # the pure-Python reference decoder breaks, while the native API keeps working and hides
+    # the problem.
+    from nsetick import layout as pylayout
+
+    assert pylayout.SPEC_DIR.is_dir(), f"spec dir not found at {pylayout.SPEC_DIR}"
+    assert set(pylayout.available()) == set(nsetick.layouts())
+
+
 def test_unknown_layout_is_rejected():
     with pytest.raises(ValueError):
         nsetick.describe("not_a_layout")
