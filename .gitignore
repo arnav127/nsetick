@@ -30,3 +30,6 @@ data/
 # Python build
 target/wheels/
 *.whl
+
+# Built wheels
+dist/
