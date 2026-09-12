@@ -122,6 +122,11 @@ nsetick.parse(path, out="data/parquet", where="series == 'EQ'", threads=6)
 nsetick.run_spec("study.json")
 ```
 
+Streaming is about 1.6x faster than going through Parquet (2.36 s vs 3.89 s for 8M records),
+because it skips Parquet encoding entirely, and a selective filter runs at the speed of gzip
+decompression. Calling from Python costs nothing over the CLI. Numbers in
+[`docs/python.md`](docs/python.md).
+
 Plus `to_pandas`, `to_polars`, `read_table`, `describe`, `probe`, `memory_estimate` and
 `check_filter`, which validates a filter against a layout in milliseconds so a typo fails
 before an hour of parsing rather than after it.

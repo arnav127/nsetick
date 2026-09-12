@@ -67,6 +67,43 @@ for r in nsetick.run_spec("study.json"):
     print(r["input"], r["rows_emitted"])
 ```
 
+## Speed
+
+8,000,000 CM order records, filter `series == 'EQ'`, 5 columns, 8-core Windows machine,
+best of two runs:
+
+| mode | time | M rows/s | output |
+|---|---|---|---|
+| `nsetick.iter_batches` -> count | 2.36 s | 3.39 | none |
+| `nsetick.read_table` -> Arrow | 2.48 s | 3.22 | none |
+| `nsetick.iter_batches` -> pandas per batch | 2.50 s | 3.20 | none |
+| `nsetick.parse()` -> Parquet | 3.89 s | 2.06 | 47 MB |
+| `nsetick` CLI -> Parquet | 4.14 s | 1.93 | 47 MB |
+| DuckDB `read_csv` -> Parquet | 8.18 s | 0.98 | 44 MB |
+
+Two things worth reading off this.
+
+**Calling from Python costs nothing.** `parse()` in-process matches the CLI (the small
+difference is process startup), because it is the same Rust pipeline with the GIL released.
+
+**Streaming is faster than writing Parquet**, by about 1.6x, because it skips Parquet
+encoding and compression entirely. If an analysis only wants filtered rows in memory, going
+through Parquet is pure overhead. Converting each batch to pandas adds about 6%, since Arrow
+to pandas is close to a zero-copy view for these types.
+
+How much is left on the table, same fixture:
+
+| | time | M rows/s |
+|---|---|---|
+| stream, filter matches nothing (inflate floor) | 1.40 s | 5.70 |
+| stream, one symbol, 3 columns | 1.50 s | 5.34 |
+| stream, all EQ rows, all 17 columns | 4.11 s | 1.95 |
+
+A selective filter runs at essentially the speed of gzip decompression, which is the hard
+floor: deflate cannot be decompressed by more than one thread. Note that streaming is
+single-threaded by design, so on wide unfiltered reads `parse()` with `threads=` will
+overtake it; streaming wins whenever the filter is selective, which is the usual case.
+
 ## Introspection
 
 ```python
