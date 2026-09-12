@@ -1,0 +1,412 @@
+//! `nsetick` command line interface.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+use chrono::NaiveDate;
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use nsetick_core::decode::{DecodeOptions, Decoder, Stats};
+use nsetick_core::{filter, layout};
+use nsetick_io::pipeline::{self, ParseRequest};
+use nsetick_io::writer::WriterOptions;
+
+#[derive(Parser)]
+#[command(
+    name = "nsetick",
+    version,
+    about = "Parse NSE historical order and trade data into Parquet",
+    long_about = "Parse NSE historical fixed-width order and trade files (CM, FAO, CD) into \
+                  partitioned Parquet.\n\nByte layouts come from spec/layouts/*.toml, which is \
+                  shared with the Python package, so offsets are defined exactly once."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Parse a .DAT.gz file into partitioned Parquet.
+    Parse(ParseArgs),
+    /// List the available layouts.
+    Layouts,
+    /// Print the fields of a layout.
+    Describe {
+        /// Layout id, e.g. cm_orders.
+        layout: String,
+        /// Session date, which selects the layout version. Defaults to today.
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// Decode and print the first few records of a file, without writing anything.
+    Inspect {
+        input: PathBuf,
+        /// Layout id. Inferred from the file name when omitted.
+        #[arg(long)]
+        layout: Option<String>,
+        /// Session date. Inferred from the file name when omitted.
+        #[arg(long)]
+        date: Option<String>,
+        /// Number of records to show.
+        #[arg(long, default_value_t = 5)]
+        n: usize,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CompressionArg {
+    Zstd,
+    Snappy,
+    None,
+}
+
+#[derive(Args)]
+struct ParseArgs {
+    /// Input .DAT.gz (or .DAT) file.
+    input: PathBuf,
+
+    /// Output root directory.
+    #[arg(long, short)]
+    out: PathBuf,
+
+    /// Layout id. Inferred from the file name when omitted.
+    #[arg(long)]
+    layout: Option<String>,
+
+    /// Session date as YYYY-MM-DD. Inferred from the file name when omitted.
+    #[arg(long)]
+    date: Option<String>,
+
+    /// Comma-separated fields to emit. Defaults to all of them.
+    #[arg(long, value_delimiter = ',')]
+    select: Option<Vec<String>>,
+
+    /// Filter expression, e.g. "series == 'EQ' and symbol in ('RELIANCE','TCS')".
+    #[arg(long = "where", default_value = "")]
+    filter: String,
+
+    /// Column to partition on, or "none".
+    #[arg(long, default_value = "symbol")]
+    partition_by: String,
+
+    #[arg(long, value_enum, default_value_t = CompressionArg::Zstd)]
+    compression: CompressionArg,
+
+    /// Target rows per row group.
+    #[arg(long, default_value_t = 256_000)]
+    row_group_rows: usize,
+
+    /// Global ceiling on rows buffered across all partitions.
+    #[arg(long, default_value_t = 4_000_000)]
+    max_buffered_rows: usize,
+
+    /// Count malformed records and carry on instead of stopping at the first one.
+    #[arg(long)]
+    lenient: bool,
+
+    /// Skip the .trg size check.
+    #[arg(long)]
+    no_verify: bool,
+
+    /// Stop after roughly this many records. For smoke tests on multi-gigabyte files.
+    #[arg(long)]
+    max_records: Option<u64>,
+}
+
+/// Infer a layout id from an NSE file name, e.g. `CASH_Orders_27012022.DAT.gz`.
+fn infer_layout(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?.to_ascii_uppercase();
+    let candidates = [
+        ("CASH_ORDERS", "cm_orders"),
+        ("CASH_TRADES", "cm_trades"),
+        ("CASH_INDEX", "cm_index"),
+        ("FAO_ORDERS", "fao_orders"),
+        ("FAO_TRADES", "fao_trades"),
+        ("CDS_ORDERS", "cd_orders"),
+        ("CDS_TRADES", "cd_trades"),
+    ];
+    candidates
+        .iter()
+        .find(|(prefix, _)| name.starts_with(prefix))
+        .map(|(_, id)| *id)
+}
+
+/// Infer the session date from the DDMMYYYY component of an NSE file name.
+fn infer_date(path: &Path) -> Option<NaiveDate> {
+    let name = path.file_name()?.to_str()?;
+    // Scan for the first 8-digit run that parses as DDMMYYYY.
+    let bytes = name.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i - start == 8 {
+                let s = &name[start..i];
+                let d: u32 = s[0..2].parse().ok()?;
+                let m: u32 = s[2..4].parse().ok()?;
+                let y: i32 = s[4..8].parse().ok()?;
+                return NaiveDate::from_ymd_opt(y, m, d);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn resolve_layout(explicit: &Option<String>, path: &Path) -> Result<String> {
+    if let Some(id) = explicit {
+        return Ok(id.clone());
+    }
+    infer_layout(path).map(str::to_string).with_context(|| {
+        format!(
+            "cannot infer a layout from {:?}; pass --layout (one of: {})",
+            path.file_name().unwrap_or_default(),
+            layout::available().join(", ")
+        )
+    })
+}
+
+fn resolve_date(explicit: &Option<String>, path: &Path) -> Result<NaiveDate> {
+    if let Some(s) = explicit {
+        return NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .with_context(|| format!("parsing --date {s:?} as YYYY-MM-DD"));
+    }
+    infer_date(path).with_context(|| {
+        format!(
+            "cannot infer a session date from {:?}; pass --date YYYY-MM-DD",
+            path.file_name().unwrap_or_default()
+        )
+    })
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    format!("{v:.2} {}", UNITS[u])
+}
+
+fn cmd_parse(args: ParseArgs) -> Result<()> {
+    let layout_id = resolve_layout(&args.layout, &args.input)?;
+    let date = resolve_date(&args.date, &args.input)?;
+
+    let partition_by = match args.partition_by.as_str() {
+        "none" | "" => None,
+        other => Some(other.to_string()),
+    };
+
+    let compression = match args.compression {
+        CompressionArg::Zstd => parquet::basic::Compression::ZSTD(
+            parquet::basic::ZstdLevel::try_new(3).expect("level 3 is valid"),
+        ),
+        CompressionArg::Snappy => parquet::basic::Compression::SNAPPY,
+        CompressionArg::None => parquet::basic::Compression::UNCOMPRESSED,
+    };
+
+    let mut req = ParseRequest::new(&args.input, &layout_id, date, &args.out);
+    req.select = args.select.clone();
+    req.filter = args.filter.clone();
+    req.strict = !args.lenient;
+    req.verify_trigger = !args.no_verify;
+    req.max_records = args.max_records;
+    req.writer = WriterOptions {
+        compression,
+        row_group_rows: args.row_group_rows,
+        max_buffered_rows: args.max_buffered_rows,
+        partition_by,
+    };
+
+    eprintln!(
+        "nsetick: {} -> {}\n  layout {} | session {}",
+        args.input.display(),
+        args.out.display(),
+        layout_id,
+        date
+    );
+
+    let report = pipeline::run(&req)?;
+    let s: Stats = report.stats;
+
+    println!("layout version    {} ({} B records)", report.spec_version, report.record_length);
+    println!("decompressed      {}", human_bytes(report.bytes_decompressed));
+    println!("rows read         {}", s.rows_read);
+    println!("rows written      {}", s.rows_emitted);
+    println!("rows filtered out {}", s.rows_filtered);
+    if s.rows_malformed > 0 {
+        println!("rows malformed    {}  <-- inspect before trusting this output", s.rows_malformed);
+    }
+    println!("partitions        {}", report.partitions);
+    println!(
+        "elapsed           {:.1}s  ({:.0} MB/s decompressed, {:.2} M rows/s)",
+        report.elapsed_secs,
+        report.throughput_mb_s(),
+        report.rows_per_sec() / 1e6
+    );
+    println!("manifest          {}", report.manifest_path.display());
+    Ok(())
+}
+
+fn cmd_layouts() -> Result<()> {
+    for id in layout::available() {
+        let l = layout::load(id)?;
+        let lengths: Vec<String> = l
+            .versions
+            .iter()
+            .map(|v| {
+                let mark = if v.verified { "" } else { "?" };
+                format!("{}{mark}", v.record_length)
+            })
+            .collect();
+        println!(
+            "{:<11} {:<3} {:<7} {:<28} records: {}",
+            id,
+            l.meta.segment,
+            l.meta.kind,
+            l.meta.file_glob.replace("{date}", "DDMMYYYY"),
+            lengths.join(", ")
+        );
+    }
+    println!("\n? marks a layout version not yet checked against a real file.");
+    Ok(())
+}
+
+fn cmd_describe(layout_id: &str, date: Option<String>) -> Result<()> {
+    let l = layout::load(layout_id)?;
+    let date = match date {
+        Some(s) => NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+            .with_context(|| format!("parsing --date {s:?}"))?,
+        None => chrono::Local::now().date_naive(),
+    };
+    let v = l.for_date(date)?;
+
+    println!("{} - {}", l.meta.id, l.meta.description);
+    println!(
+        "spec {} valid {} to {}, {} byte records{}\n",
+        v.spec_version,
+        v.valid_from,
+        v.valid_to,
+        v.record_length,
+        if v.verified { "" } else { "  [UNVERIFIED]" }
+    );
+    println!("{:<22} {:>6} {:>5}  {:<11} {}", "field", "offset", "len", "type", "notes");
+    for f in &v.fields {
+        let mut notes = Vec::new();
+        if let Some(p) = f.pad {
+            notes.push(format!("pad {p:?}"));
+        }
+        if let Some(s) = f.scale {
+            notes.push(format!("scale {s}"));
+        }
+        println!(
+            "{:<22} {:>6} {:>5}  {:<11} {}",
+            f.name,
+            f.offset,
+            f.len,
+            format!("{:?}", f.ty),
+            notes.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn cmd_inspect(input: PathBuf, layout_id: Option<String>, date: Option<String>, n: usize) -> Result<()> {
+    let layout_id = resolve_layout(&layout_id, &input)?;
+    let date = resolve_date(&date, &input)?;
+    let l = layout::load(&layout_id)?;
+
+    let observed = pipeline::probe_record_length(&input)?;
+    let v = l.resolve(date, Some(observed))?;
+
+    println!(
+        "{}\n  layout {} spec {} | {} byte records | session {}\n",
+        input.display(),
+        layout_id,
+        v.spec_version,
+        v.record_length,
+        date
+    );
+
+    let want = n * v.line_length();
+    let bytes = pipeline::head_bytes(&input, want)?;
+    let usable = bytes.len() - (bytes.len() % v.line_length());
+    if usable == 0 {
+        bail!("file has no complete records");
+    }
+
+    let decoder = Decoder::new(v, None, DecodeOptions { strict: true })?;
+    let mut stats = Stats::default();
+    let batch = decoder.decode(&bytes[..usable], &filter::Predicate::True, &mut stats)?;
+
+    for row in 0..batch.num_rows() {
+        println!("record {row}:");
+        for (i, f) in batch.schema().fields().iter().enumerate() {
+            let col = arrow::util::display::array_value_to_string(batch.column(i), row)
+                .unwrap_or_else(|_| "<unprintable>".into());
+            println!("  {:<22} {}", f.name(), col);
+        }
+        println!();
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Parse(args) => cmd_parse(args),
+        Command::Layouts => cmd_layouts(),
+        Command::Describe { layout, date } => cmd_describe(&layout, date),
+        Command::Inspect {
+            input,
+            layout,
+            date,
+            n,
+        } => cmd_inspect(input, layout, date, n),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn layout_is_inferred_from_nse_file_names() {
+        assert_eq!(infer_layout(Path::new("CASH_Orders_27012022.DAT.gz")), Some("cm_orders"));
+        assert_eq!(infer_layout(Path::new("CASH_Trades_27012022.DAT.gz")), Some("cm_trades"));
+        assert_eq!(
+            infer_layout(Path::new("FAO_Orders_27012022_01.DAT.gz")),
+            Some("fao_orders")
+        );
+        assert_eq!(infer_layout(Path::new("CDS_Trades_27012022.DAT.gz")), Some("cd_trades"));
+        assert_eq!(infer_layout(Path::new("something_else.gz")), None);
+    }
+
+    #[test]
+    fn date_is_inferred_from_the_ddmmyyyy_component() {
+        assert_eq!(
+            infer_date(Path::new("CASH_Orders_27012022.DAT.gz")),
+            NaiveDate::from_ymd_opt(2022, 1, 27)
+        );
+        // Split FAO files carry a stream suffix after the date.
+        assert_eq!(
+            infer_date(Path::new("FAO_Orders_30062022_11.DAT.gz")),
+            NaiveDate::from_ymd_opt(2022, 6, 30)
+        );
+        assert_eq!(infer_date(Path::new("no_date_here.DAT.gz")), None);
+        // 32 is not a day, so this must not silently produce a wrong date.
+        assert_eq!(infer_date(Path::new("CASH_Orders_32012022.DAT.gz")), None);
+    }
+
+    #[test]
+    fn byte_sizes_render_readably() {
+        assert_eq!(human_bytes(0), "0.00 B");
+        assert_eq!(human_bytes(8_260_000_000), "7.69 GB");
+    }
+}

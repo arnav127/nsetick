@@ -1,0 +1,20 @@
+[package]
+name = "nsetick-cli"
+description = "Command line interface for nsetick"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nsetick"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+arrow = { version = "59.3.0", default-features = false }
+chrono.workspace = true
+clap = { version = "4.6.6", features = ["derive"] }
+nsetick-core.workspace = true
+nsetick-io.workspace = true
+parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd"] }
