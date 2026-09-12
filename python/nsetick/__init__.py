@@ -36,10 +36,10 @@ from ._native import (
     describe,
     layouts,
     memory_estimate,
-    parse,
     probe,
     run_spec,
 )
+from ._native import parse as _native_parse
 from ._native import version as _native_version
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -62,6 +62,51 @@ __all__ = [
     "to_polars",
     "__version__",
 ]
+
+
+def parse(
+    input: str,
+    out: str,
+    *,
+    layout: str | None = None,
+    date: str | None = None,
+    select: Sequence[str] | None = None,
+    where: str | None = None,
+    partition_by: str | None = "symbol",
+    compression: str = "zstd",
+    threads: int | None = None,
+    strict: bool = True,
+    verify_trigger: bool = True,
+    memory_limit_mb: int | None = None,
+    max_records: int | None = None,
+    row_group_rows: int | None = None,
+    note: str | None = None,
+) -> dict:
+    """Parse one NSE file into partitioned Parquet, returning a summary dict.
+
+    ``layout`` and ``date`` are inferred from the file name when omitted. ``where`` is
+    validated against the layout before any data is read.
+
+    The keyword is spelled ``where`` here, matching :func:`iter_batches`; the native function
+    underneath must call it ``where_`` because ``where`` is a Rust keyword.
+    """
+    return _native_parse(
+        input,
+        out,
+        layout=layout,
+        date=date,
+        select=list(select) if select is not None else None,
+        where_=where,
+        partition_by=partition_by,
+        compression=compression,
+        threads=threads,
+        strict=strict,
+        verify_trigger=verify_trigger,
+        memory_limit_mb=memory_limit_mb,
+        max_records=max_records,
+        row_group_rows=row_group_rows,
+        note=note,
+    )
 
 
 def iter_batches(

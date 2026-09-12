@@ -134,6 +134,15 @@ def test_memory_estimate_is_self_consistent():
     assert m["partitions_that_fit"] > 0
 
 
+def test_parse_and_iter_batches_agree_on_the_filter_keyword():
+    # parse() previously exposed the native `where_` spelling while iter_batches took
+    # `where`, so documented calls to parse(where=...) raised TypeError.
+    import inspect
+
+    assert "where" in inspect.signature(nsetick.parse).parameters
+    assert "where" in inspect.signature(nsetick.iter_batches).parameters
+
+
 def test_unknown_layout_is_rejected():
     with pytest.raises(ValueError):
         nsetick.describe("not_a_layout")
