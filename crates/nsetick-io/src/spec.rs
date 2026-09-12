@@ -65,8 +65,11 @@ pub struct JobSpec {
     /// "zstd", "snappy" or "none".
     pub compression: Option<String>,
     pub row_group_rows: Option<usize>,
+    /// Ceiling in megabytes across all writer shards. Omitted means "derive from the
+    /// machine's available memory".
     pub max_buffered_mb: Option<usize>,
     pub chunk_mb: Option<usize>,
+    pub data_page_kb: Option<usize>,
     pub threads: Option<usize>,
     /// Stop at the first malformed record. Defaults to true.
     pub strict: Option<bool>,
@@ -97,6 +100,7 @@ impl JobSpec {
             row_group_rows: pick!(row_group_rows),
             max_buffered_mb: pick!(max_buffered_mb),
             chunk_mb: pick!(chunk_mb),
+            data_page_kb: pick!(data_page_kb),
             threads: pick!(threads),
             strict: pick!(strict),
             verify_trigger: pick!(verify_trigger),
@@ -223,6 +227,7 @@ fn resolve(job: &JobSpec, base: &Path, index: usize) -> Result<ResolvedJob> {
     request.threads = Some(job.threads.unwrap_or_else(default_threads));
     request.chunk_bytes = job.chunk_mb.unwrap_or(8) * 1024 * 1024;
     request.note = job.note.clone();
+    request.memory_limit = job.max_buffered_mb.map(|mb| mb * 1024 * 1024);
 
     let defaults = WriterOptions::default();
     request.writer = WriterOptions {
@@ -232,10 +237,9 @@ fn resolve(job: &JobSpec, base: &Path, index: usize) -> Result<ResolvedJob> {
             None => defaults.compression,
         },
         row_group_rows: job.row_group_rows.unwrap_or(defaults.row_group_rows),
-        max_buffered_bytes: job
-            .max_buffered_mb
-            .map(|mb| mb * 1024 * 1024)
-            .unwrap_or(defaults.max_buffered_bytes),
+        // Superseded by request.memory_limit, which is shared across shards.
+        max_buffered_bytes: defaults.max_buffered_bytes,
+        data_page_size: job.data_page_kb.map(|kb| kb * 1024).unwrap_or(defaults.data_page_size),
         // Distinguishes "absent" (use the default) from "present but null" (do not partition).
         partition_by: match &job.partition_by {
             None => defaults.partition_by,

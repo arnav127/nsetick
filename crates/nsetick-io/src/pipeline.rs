@@ -40,6 +40,7 @@ use nsetick_core::filter::{self, Predicate};
 use nsetick_core::layout::{self, Layout, Version};
 
 use crate::manifest::{Manifest, PartitionRecord};
+use crate::memory::{self, MemoryGuard};
 use crate::reader::{read_trigger, RecordReader, DEFAULT_CHUNK_BYTES};
 use crate::writer::{split_by_partition, PartitionSummary, PartitionedWriter, WriterOptions};
 
@@ -61,6 +62,9 @@ pub struct ParseRequest {
     /// Stop after roughly this many records have been read. Rounded up to a chunk boundary.
     /// Intended for smoke tests against multi-gigabyte sessions.
     pub max_records: Option<u64>,
+    /// Ceiling on bytes buffered across every writer shard. `None` derives one from the
+    /// memory currently available on the machine.
+    pub memory_limit: Option<usize>,
     /// Free-text note recorded in the manifest.
     pub note: Option<String>,
     /// Worker threads for decoding and writing. `None` picks a default from the machine.
@@ -87,6 +91,7 @@ impl ParseRequest {
             verify_trigger: true,
             chunk_bytes: DEFAULT_CHUNK_BYTES,
             max_records: None,
+            memory_limit: None,
             note: None,
             threads: None,
         }
@@ -110,6 +115,10 @@ pub struct RunReport {
     pub spec_version: String,
     pub record_length: usize,
     pub threads: usize,
+    /// Footprint ceiling for the run, and the estimated peak it actually reached.
+    pub memory_limit: usize,
+    pub memory_peak: usize,
+    pub partitions_peak: usize,
 }
 
 impl RunReport {
@@ -215,8 +224,25 @@ pub fn run(req: &ParseRequest) -> Result<RunReport> {
 
     let threads = req.threads.unwrap_or_else(default_threads).max(1);
 
-    let (stats, bytes_decompressed, partitions) =
-        execute(req, &version, decoder, predicate, prefix, threads)?;
+    // Everything outside the writer budget's control: chunks in flight on the channels, the
+    // decoded batches queued behind them, and the fixed cost of thousands of open writers.
+    let headroom = req.chunk_bytes * (threads * 4 + 8) + 256 * 1024 * 1024;
+    let (auto_footprint, auto_buffer) = memory::default_limits(headroom);
+    let footprint = req.memory_limit.unwrap_or(auto_footprint);
+    // Buffering is elastic and measurement showed it does not affect throughput, so it never
+    // takes more than a quarter of the footprint the partitions need.
+    let buffer = auto_buffer.min(footprint / 4).max(64 * 1024 * 1024);
+    let budget = MemoryGuard::new(footprint, buffer);
+
+    let (stats, bytes_decompressed, partitions) = execute(
+        req,
+        &version,
+        decoder,
+        predicate,
+        prefix,
+        threads,
+        Arc::clone(&budget),
+    )?;
 
     let elapsed = started.elapsed().as_secs_f64();
 
@@ -265,6 +291,9 @@ pub fn run(req: &ParseRequest) -> Result<RunReport> {
         spec_version: version.spec_version,
         record_length: version.record_length,
         threads,
+        memory_limit: budget.footprint_limit(),
+        memory_peak: budget.projected_bytes(),
+        partitions_peak: budget.partitions_peak(),
     })
 }
 
@@ -276,6 +305,7 @@ fn execute(
     predicate: Predicate,
     prefix: Vec<(String, String)>,
     threads: usize,
+    budget: Arc<MemoryGuard>,
 ) -> Result<(Stats, u64, Vec<PartitionSummary>)> {
     let schema = decoder.schema();
     let part_col = match &req.writer.partition_by {
@@ -387,8 +417,9 @@ fn execute(
             let prefix = prefix.clone();
             let schema = Arc::clone(&schema);
             let opts = req.writer.clone();
+            let budget = Arc::clone(&budget);
             writer_handles.push(scope.spawn(move || -> Result<Vec<PartitionSummary>> {
-                let mut w = PartitionedWriter::new(root, prefix, schema, opts)?;
+                let mut w = PartitionedWriter::with_budget(root, prefix, schema, opts, budget)?;
                 for group in rx.iter() {
                     for (key, batch) in group {
                         w.write_partition(&key, batch)?;
