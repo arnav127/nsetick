@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nsetick-core", "crates/nsetick-io", "crates/nsetick-cli"]
+members = ["crates/nsetick-core", "crates/nsetick-io", "crates/nsetick-cli", "crates/nsetick-py"]
 
 [workspace.package]
 version = "0.1.0"

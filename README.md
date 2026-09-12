@@ -95,6 +95,40 @@ SELECT * FROM read_parquet('parquet/**/*.parquet', hive_partitioning = 1)
 WHERE symbol = 'RELIANCE';
 ```
 
+## Python
+
+```bash
+pip install maturin && maturin develop --release
+```
+
+Stream Arrow batches straight into a process, no Parquet round trip, memory flat regardless
+of session size:
+
+```python
+import nsetick
+
+for batch in nsetick.iter_batches(
+    "CASH_Orders_27012022.DAT.gz",
+    where="symbol == 'RELIANCE' and activity_type == 1",
+    select=["symbol", "txn_time", "limit_price", "volume_original"],
+):
+    df = batch.to_pandas()
+```
+
+Or write Parquet, the same as the CLI:
+
+```python
+nsetick.parse(path, out="data/parquet", where="series == 'EQ'", threads=6)
+nsetick.run_spec("study.json")
+```
+
+Plus `to_pandas`, `to_polars`, `read_table`, `describe`, `probe`, `memory_estimate` and
+`check_filter`, which validates a filter against a layout in milliseconds so a typo fails
+before an hour of parsing rather than after it.
+
+Full guide, including how to migrate the existing DuckDB parsers:
+[`docs/python.md`](docs/python.md).
+
 ## Filter language
 
 ```text
@@ -166,9 +200,9 @@ Raising the buffer budget does not buy throughput: measured across budgets from 
 |---|---|---|
 | `cm_orders` | CM | 87 |
 | `cm_trades` | CM | 100 |
-| `cm_index` | CM | 38 (unverified) |
-| `fao_orders` | FAO | 112, 111 before spec 1.7 |
-| `fao_trades` | FAO | 124, 123 before 2020-09-07 |
+| `cm_index` | CM | 38 |
+| `fao_orders` | FAO | 112, 111 before spec 1.7 (unverified) |
+| `fao_trades` | FAO | 124, 123 before 2020-09-07 (unverified) |
 | `cd_orders` | CD | 112, 111 before spec 1.7 (unverified) |
 | `cd_trades` | CD | 123 (unverified) |
 
@@ -187,7 +221,8 @@ spec/layouts/*.toml     the single source of truth for every byte offset
 crates/nsetick-core     layout registry, decoder, filter engine
 crates/nsetick-io       gzip reader, partitioned Parquet writer, manifests
 crates/nsetick-cli      the nsetick binary
-python/nsetick          reads the same TOML specs; reference decoder
+crates/nsetick-py       PyO3 bindings
+python/nsetick          the Python package; reference decoder
 ```
 
 ## License

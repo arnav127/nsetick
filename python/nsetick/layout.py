@@ -13,7 +13,23 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
-SPEC_DIR = Path(__file__).resolve().parents[2] / "spec" / "layouts"
+def _find_spec_dir() -> Path:
+    """Locate spec/layouts, whether running from a checkout or an installed wheel."""
+    here = Path(__file__).resolve()
+    candidates = [
+        here.parents[2] / "spec" / "layouts",   # source checkout: <repo>/spec/layouts
+        here.parent / "spec" / "layouts",       # installed wheel: nsetick/spec/layouts
+        here.parent / "layouts",
+    ]
+    for c in candidates:
+        if c.is_dir():
+            return c
+    # The native module embeds the same specs, so this is only a problem for the pure-Python
+    # reference decoder.
+    return candidates[0]
+
+
+SPEC_DIR = _find_spec_dir()
 
 # NSE writes the literal character 'b' as the blank fill byte, because the layout document
 # denotes a blank as "b" ("Symbol ABC will be 'bbbbbbbABC'") and the generator emitted the
