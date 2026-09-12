@@ -1,5 +1,11 @@
 //! `nsetick` command line interface.
 
+// Arrow arrays are allocated on the decode workers and freed on the writer shards, so the
+// pipeline generates a lot of cross-thread allocator traffic. The Windows system allocator
+// serialises badly under that pattern; mimalloc's per-thread heaps do not.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -8,6 +14,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use nsetick_core::decode::{DecodeOptions, Decoder, Stats};
 use nsetick_core::{filter, layout};
 use nsetick_io::pipeline::{self, ParseRequest};
+use nsetick_io::{infer_date, infer_layout, spec};
 use nsetick_io::writer::WriterOptions;
 
 #[derive(Parser)]
@@ -37,6 +44,14 @@ enum Command {
         /// Session date, which selects the layout version. Defaults to today.
         #[arg(long)]
         date: Option<String>,
+    },
+    /// Run one or more parses described by a JSON spec file.
+    Run {
+        /// Path to the JSON run spec.
+        spec: PathBuf,
+        /// Print the resolved jobs and exit without parsing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Decode and print the first few records of a file, without writing anything.
     Inspect {
@@ -96,9 +111,9 @@ struct ParseArgs {
     #[arg(long, default_value_t = 256_000)]
     row_group_rows: usize,
 
-    /// Global ceiling on rows buffered across all partitions.
-    #[arg(long, default_value_t = 4_000_000)]
-    max_buffered_rows: usize,
+    /// Ceiling in megabytes on what is buffered across all open partitions.
+    #[arg(long, default_value_t = 256)]
+    max_buffered_mb: usize,
 
     /// Count malformed records and carry on instead of stopping at the first one.
     #[arg(long)]
@@ -111,50 +126,16 @@ struct ParseArgs {
     /// Stop after roughly this many records. For smoke tests on multi-gigabyte files.
     #[arg(long)]
     max_records: Option<u64>,
-}
 
-/// Infer a layout id from an NSE file name, e.g. `CASH_Orders_27012022.DAT.gz`.
-fn infer_layout(path: &Path) -> Option<&'static str> {
-    let name = path.file_name()?.to_str()?.to_ascii_uppercase();
-    let candidates = [
-        ("CASH_ORDERS", "cm_orders"),
-        ("CASH_TRADES", "cm_trades"),
-        ("CASH_INDEX", "cm_index"),
-        ("FAO_ORDERS", "fao_orders"),
-        ("FAO_TRADES", "fao_trades"),
-        ("CDS_ORDERS", "cd_orders"),
-        ("CDS_TRADES", "cd_trades"),
-    ];
-    candidates
-        .iter()
-        .find(|(prefix, _)| name.starts_with(prefix))
-        .map(|(_, id)| *id)
-}
+    /// Decompressed bytes read per work unit, in megabytes. Larger chunks mean larger
+    /// per-symbol batches, which cuts per-partition write overhead.
+    #[arg(long, default_value_t = 8)]
+    chunk_mb: usize,
 
-/// Infer the session date from the DDMMYYYY component of an NSE file name.
-fn infer_date(path: &Path) -> Option<NaiveDate> {
-    let name = path.file_name()?.to_str()?;
-    // Scan for the first 8-digit run that parses as DDMMYYYY.
-    let bytes = name.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i].is_ascii_digit() {
-            let start = i;
-            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                i += 1;
-            }
-            if i - start == 8 {
-                let s = &name[start..i];
-                let d: u32 = s[0..2].parse().ok()?;
-                let m: u32 = s[2..4].parse().ok()?;
-                let y: i32 = s[4..8].parse().ok()?;
-                return NaiveDate::from_ymd_opt(y, m, d);
-            }
-        } else {
-            i += 1;
-        }
-    }
-    None
+    /// Decode and writer threads. Defaults to the machine's parallelism less two, leaving a
+    /// core for the inflate thread.
+    #[arg(long, short = 'j')]
+    threads: Option<usize>,
 }
 
 fn resolve_layout(explicit: &Option<String>, path: &Path) -> Result<String> {
@@ -217,10 +198,12 @@ fn cmd_parse(args: ParseArgs) -> Result<()> {
     req.strict = !args.lenient;
     req.verify_trigger = !args.no_verify;
     req.max_records = args.max_records;
+    req.threads = args.threads;
+    req.chunk_bytes = args.chunk_mb * 1024 * 1024;
     req.writer = WriterOptions {
         compression,
         row_group_rows: args.row_group_rows,
-        max_buffered_rows: args.max_buffered_rows,
+        max_buffered_bytes: args.max_buffered_mb * 1024 * 1024,
         partition_by,
     };
 
@@ -233,8 +216,12 @@ fn cmd_parse(args: ParseArgs) -> Result<()> {
     );
 
     let report = pipeline::run(&req)?;
-    let s: Stats = report.stats;
+    print_report(&report);
+    Ok(())
+}
 
+fn print_report(report: &pipeline::RunReport) {
+    let s = report.stats;
     println!("layout version    {} ({} B records)", report.spec_version, report.record_length);
     println!("decompressed      {}", human_bytes(report.bytes_decompressed));
     println!("rows read         {}", s.rows_read);
@@ -244,6 +231,7 @@ fn cmd_parse(args: ParseArgs) -> Result<()> {
         println!("rows malformed    {}  <-- inspect before trusting this output", s.rows_malformed);
     }
     println!("partitions        {}", report.partitions);
+    println!("threads           {}", report.threads);
     println!(
         "elapsed           {:.1}s  ({:.0} MB/s decompressed, {:.2} M rows/s)",
         report.elapsed_secs,
@@ -251,6 +239,50 @@ fn cmd_parse(args: ParseArgs) -> Result<()> {
         report.rows_per_sec() / 1e6
     );
     println!("manifest          {}", report.manifest_path.display());
+}
+
+fn cmd_run(spec_path: &Path, dry_run: bool) -> Result<()> {
+    let jobs = spec::load(spec_path)?;
+    eprintln!("nsetick: {} job(s) from {}", jobs.len(), spec_path.display());
+
+    for (i, job) in jobs.iter().enumerate() {
+        let r = &job.request;
+        eprintln!(
+            "  [{}/{}] {} -> {}
+        layout {} | session {} | threads {} | where {:?}",
+            i + 1,
+            jobs.len(),
+            r.input.display(),
+            r.out_root.display(),
+            r.layout_id,
+            r.session_date,
+            r.threads.unwrap_or(0),
+            r.filter
+        );
+    }
+    if dry_run {
+        eprintln!("dry run: nothing was parsed");
+        return Ok(());
+    }
+
+    let started = std::time::Instant::now();
+    let mut total_rows = 0u64;
+    for (i, job) in jobs.iter().enumerate() {
+        println!("
+--- job {}/{}: {} ---", i + 1, jobs.len(), job.request.input.display());
+        let report = pipeline::run(&job.request)?;
+        total_rows += report.stats.rows_emitted;
+        print_report(&report);
+    }
+    if jobs.len() > 1 {
+        println!(
+            "
+all {} jobs done: {} rows written in {:.1}s",
+            jobs.len(),
+            total_rows,
+            started.elapsed().as_secs_f64()
+        );
+    }
     Ok(())
 }
 
@@ -361,6 +393,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Parse(args) => cmd_parse(args),
+        Command::Run { spec, dry_run } => cmd_run(&spec, dry_run),
         Command::Layouts => cmd_layouts(),
         Command::Describe { layout, date } => cmd_describe(&layout, date),
         Command::Inspect {

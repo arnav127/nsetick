@@ -7,9 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = []
-# Link zlib-ng instead of the pure-Rust inflate. Roughly 2x faster, but it needs cmake on
-# the build machine, so it is opt-in rather than the default.
+# zlib-rs is a pure-Rust port of zlib-ng: markedly faster than the miniz_oxide default and,
+# unlike the C zlib-ng binding, needs no cmake or system library. Inflate is the wall in this
+# pipeline, so it is on by default.
+default = ["fast-inflate"]
+fast-inflate = ["flate2/zlib-rs"]
+# The C zlib-ng binding, for builds that would rather link the original. Requires cmake.
 zlib-ng = ["flate2/zlib-ng"]
 
 [dependencies]
@@ -18,7 +21,7 @@ chrono.workspace = true
 serde.workspace = true
 nsetick-core.workspace = true
 arrow = { version = "59.3.0", default-features = false }
-parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd"] }
+parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
 flate2 = "1.1.10"
 crossbeam-channel = "0.5.17"
 serde_json = "1.0.151"

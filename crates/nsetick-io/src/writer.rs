@@ -11,13 +11,14 @@
 //! Partitioning by symbol is close to free here. NSE emits records in time order, so
 //! demultiplexing by symbol yields partitions that are already sorted by `txn_time` with no
 //! sort step at all. Any layout that does not partition by symbol needs an external sort of
-//! ~665 million rows per session to get the same row-group pruning.
+//! ~684 million rows per session to get the same row-group pruning.
 //!
-//! The cost is that a session touches ~2000 symbols at once, and 2000 writers cannot each
-//! hold a full row group in memory. A global row budget bounds that: when the total buffered
-//! across all partitions exceeds the budget, the largest partition is flushed. Busy symbols
-//! therefore get large, well-compressed row groups and illiquid ones get small files, which
-//! is the right outcome in both cases.
+//! The cost is that a session touches ~2000 symbols at once. Batches go straight into each
+//! partition's `ArrowWriter`, which rolls its own row groups; a byte budget across all open
+//! partitions closes a row group on the largest whenever the total gets too big. Buffering
+//! batches ourselves and concatenating them later was measurably worse: on a session where
+//! most partitions never reach the row-group threshold, it degenerates into holding the whole
+//! output in memory as thousands of tiny batches.
 
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -26,7 +27,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, StringArray, UInt32Array};
-use arrow::compute::{concat_batches, take};
+use arrow::compute::take;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -39,8 +40,8 @@ pub struct WriterOptions {
     /// Target rows per row group. 256k rows of a CM order record is roughly 20 MB
     /// uncompressed, which keeps row-group pruning granular without fragmenting pages.
     pub row_group_rows: usize,
-    /// Global ceiling on rows buffered across all partitions before the largest is spilled.
-    pub max_buffered_rows: usize,
+    /// Ceiling on bytes buffered across all open partitions before the largest is spilled.
+    pub max_buffered_bytes: usize,
     /// Column to partition on, in addition to the fixed segment/kind/date prefix.
     pub partition_by: Option<String>,
 }
@@ -50,7 +51,7 @@ impl Default for WriterOptions {
         Self {
             compression: Compression::ZSTD(ZstdLevel::try_new(3).expect("level 3 is valid")),
             row_group_rows: 256_000,
-            max_buffered_rows: 4_000_000,
+            max_buffered_bytes: 256 * 1024 * 1024,
             partition_by: Some("symbol".to_string()),
         }
     }
@@ -78,11 +79,57 @@ fn sanitize(value: &str) -> String {
     out
 }
 
+/// Split a batch into one sub-batch per distinct value of the partition column.
+///
+/// Row order is preserved within each group, which is what keeps each symbol's output sorted
+/// by time: NSE writes a symbol's records contiguously and in time order, and `take` with
+/// ascending indices does not disturb that.
+pub fn split_by_partition(
+    batch: &RecordBatch,
+    part_col: usize,
+) -> Result<Vec<(String, RecordBatch)>> {
+    let col = batch
+        .column(part_col)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .context("partition column is not a string array")?;
+
+    let mut groups: HashMap<&str, Vec<u32>> = HashMap::new();
+    for i in 0..col.len() {
+        let key = if col.is_null(i) { "" } else { col.value(i) };
+        groups.entry(key).or_default().push(i as u32);
+    }
+
+    // Whole-batch-is-one-partition is common once chunks get small; skip the gather.
+    if groups.len() == 1 {
+        let key = groups.keys().next().expect("one group").to_string();
+        return Ok(vec![(key, batch.clone())]);
+    }
+
+    let schema = batch.schema();
+    let mut out = Vec::with_capacity(groups.len());
+    for (key, idxs) in groups {
+        let indices = UInt32Array::from(idxs);
+        let cols = batch
+            .columns()
+            .iter()
+            .map(|c| take(c.as_ref(), &indices, None))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("gathering partition rows")?;
+        out.push((
+            key.to_string(),
+            RecordBatch::try_new(Arc::clone(&schema), cols)
+                .context("building partition batch")?,
+        ));
+    }
+    Ok(out)
+}
+
 struct Partition {
     writer: ArrowWriter<File>,
     path: PathBuf,
-    pending: Vec<RecordBatch>,
-    pending_rows: usize,
+    /// Bytes the writer is holding for the row group it is currently building.
+    in_progress: usize,
     rows_total: u64,
 }
 
@@ -95,7 +142,9 @@ pub struct PartitionedWriter {
     /// Index of the partition column within the schema, resolved once.
     part_col: Option<usize>,
     parts: HashMap<String, Partition>,
-    buffered_rows: usize,
+    /// Running sum of every partition's `in_progress`, maintained incrementally so the write
+    /// path does not walk 2000 partitions per batch.
+    buffered_bytes: usize,
     rows_written: u64,
 }
 
@@ -144,9 +193,14 @@ impl PartitionedWriter {
             opts,
             part_col,
             parts: HashMap::new(),
-            buffered_rows: 0,
+            buffered_bytes: 0,
             rows_written: 0,
         })
+    }
+
+    /// Index of the partition column in the schema, if partitioning is enabled.
+    pub fn part_col(&self) -> Option<usize> {
+        self.part_col
     }
 
     fn dir_for(&self, key: &str) -> PathBuf {
@@ -163,24 +217,21 @@ impl PartitionedWriter {
     fn partition_mut(&mut self, key: &str) -> Result<&mut Partition> {
         if !self.parts.contains_key(key) {
             let dir = self.dir_for(key);
-            fs::create_dir_all(&dir)
-                .with_context(|| format!("creating {}", dir.display()))?;
+            fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
             let path = dir.join("part-000.parquet");
-            let file = File::create(&path)
-                .with_context(|| format!("creating {}", path.display()))?;
-            let writer = ArrowWriter::try_new(
-                file,
-                Arc::clone(&self.schema),
-                Some(self.props.clone()),
-            )
-            .with_context(|| format!("opening parquet writer for {}", path.display()))?;
+            let file =
+                File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+            let writer =
+                ArrowWriter::try_new(file, Arc::clone(&self.schema), Some(self.props.clone()))
+                    .with_context(|| {
+                        format!("opening parquet writer for {}", path.display())
+                    })?;
             self.parts.insert(
                 key.to_string(),
                 Partition {
                     writer,
                     path,
-                    pending: Vec::new(),
-                    pending_rows: 0,
+                    in_progress: 0,
                     rows_total: 0,
                 },
             );
@@ -193,79 +244,49 @@ impl PartitionedWriter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        self.rows_written += batch.num_rows() as u64;
-
         match self.part_col {
-            None => self.push("", batch.clone())?,
+            None => self.write_partition("", batch.clone()),
             Some(idx) => {
-                let col = batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .context("partition column is not a string array")?;
-
-                // Group row indices by partition value, then gather each group with `take`.
-                let mut groups: HashMap<&str, Vec<u32>> = HashMap::new();
-                for i in 0..col.len() {
-                    let key = if col.is_null(i) { "" } else { col.value(i) };
-                    groups.entry(key).or_default().push(i as u32);
+                for (key, slice) in split_by_partition(batch, idx)? {
+                    self.write_partition(&key, slice)?;
                 }
-
-                // A single-symbol batch is the common case once chunks get small; avoid the
-                // copy entirely when the whole batch belongs to one partition.
-                if groups.len() == 1 {
-                    let key = groups.keys().next().expect("one group").to_string();
-                    self.push(&key, batch.clone())?;
-                    return Ok(());
-                }
-
-                let mut slices: Vec<(String, RecordBatch)> = Vec::with_capacity(groups.len());
-                for (key, idxs) in groups {
-                    let indices = UInt32Array::from(idxs);
-                    let cols = batch
-                        .columns()
-                        .iter()
-                        .map(|c| take(c.as_ref(), &indices, None))
-                        .collect::<std::result::Result<Vec<_>, _>>()
-                        .context("gathering partition rows")?;
-                    slices.push((
-                        key.to_string(),
-                        RecordBatch::try_new(Arc::clone(&self.schema), cols)
-                            .context("building partition batch")?,
-                    ));
-                }
-                for (key, slice) in slices {
-                    self.push(&key, slice)?;
-                }
+                Ok(())
             }
         }
+    }
 
+    /// Append a batch that has already been split, all of whose rows belong to `key`.
+    ///
+    /// Splitting is the second most expensive stage after decoding, so the parallel pipeline
+    /// does it on its worker threads and hands the results straight to the owning shard.
+    pub fn write_partition(&mut self, key: &str, batch: RecordBatch) -> Result<()> {
+        if batch.num_rows() == 0 {
+            return Ok(());
+        }
+        let rows = batch.num_rows() as u64;
+        self.rows_written += rows;
+
+        let part = self.partition_mut(key)?;
+        let before = part.in_progress;
+        part.writer
+            .write(&batch)
+            .with_context(|| format!("writing to {}", part.path.display()))?;
+        part.rows_total += rows;
+        part.in_progress = part.writer.in_progress_size();
+        let after = part.in_progress;
+
+        self.buffered_bytes = self.buffered_bytes + after - before.min(after);
         self.enforce_budget()
     }
 
-    fn push(&mut self, key: &str, batch: RecordBatch) -> Result<()> {
-        let rows = batch.num_rows();
-        let target = self.opts.row_group_rows;
-        let part = self.partition_mut(key)?;
-        part.pending.push(batch);
-        part.pending_rows += rows;
-        part.rows_total += rows as u64;
-        self.buffered_rows += rows;
-
-        if self.parts[key].pending_rows >= target {
-            self.flush_partition(key)?;
-        }
-        Ok(())
-    }
-
-    /// Spill the largest partitions until the global buffer is back under budget.
+    /// Close row groups on the largest partitions until the byte budget is satisfied.
     fn enforce_budget(&mut self) -> Result<()> {
-        while self.buffered_rows > self.opts.max_buffered_rows {
+        while self.buffered_bytes > self.opts.max_buffered_bytes {
             let Some(key) = self
                 .parts
                 .iter()
-                .filter(|(_, p)| p.pending_rows > 0)
-                .max_by_key(|(_, p)| p.pending_rows)
+                .filter(|(_, p)| p.in_progress > 0)
+                .max_by_key(|(_, p)| p.in_progress)
                 .map(|(k, _)| k.clone())
             else {
                 break;
@@ -276,24 +297,16 @@ impl PartitionedWriter {
     }
 
     fn flush_partition(&mut self, key: &str) -> Result<()> {
-        let schema = Arc::clone(&self.schema);
         let part = self.parts.get_mut(key).context("unknown partition")?;
-        if part.pending.is_empty() {
+        if part.in_progress == 0 {
             return Ok(());
         }
-        let merged = concat_batches(&schema, part.pending.iter())
-            .with_context(|| format!("concatenating pending batches for {key:?}"))?;
-        part.writer
-            .write(&merged)
-            .with_context(|| format!("writing {}", part.path.display()))?;
-        // Close the row group so statistics are emitted at this granularity.
+        // Closes the current row group so its statistics are emitted at this granularity.
         part.writer
             .flush()
             .with_context(|| format!("flushing row group in {}", part.path.display()))?;
-
-        self.buffered_rows -= part.pending_rows;
-        part.pending.clear();
-        part.pending_rows = 0;
+        self.buffered_bytes = self.buffered_bytes.saturating_sub(part.in_progress);
+        part.in_progress = 0;
         Ok(())
     }
 
@@ -305,13 +318,8 @@ impl PartitionedWriter {
         self.parts.len()
     }
 
-    /// Flush every partition and close every file, returning per-partition row counts.
+    /// Close every file, returning per-partition row counts.
     pub fn finish(mut self) -> Result<Vec<PartitionSummary>> {
-        let keys: Vec<String> = self.parts.keys().cloned().collect();
-        for key in &keys {
-            self.flush_partition(key)?;
-        }
-
         let mut out = Vec::with_capacity(self.parts.len());
         for (key, part) in self.parts.drain() {
             let path = part.path.clone();
@@ -343,7 +351,7 @@ pub struct PartitionSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int64Array, StringArray};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -373,7 +381,10 @@ mod tests {
 
     fn read_all(path: &Path) -> Vec<(String, i64)> {
         let f = File::open(path).unwrap();
-        let reader = ParquetRecordBatchReaderBuilder::try_new(f).unwrap().build().unwrap();
+        let reader = ParquetRecordBatchReaderBuilder::try_new(f)
+            .unwrap()
+            .build()
+            .unwrap();
         let mut out = Vec::new();
         for b in reader {
             let b = b.unwrap();
@@ -396,14 +407,18 @@ mod tests {
         ];
         let mut w =
             PartitionedWriter::new(&root, prefix, schema(), WriterOptions::default()).unwrap();
-        w.write(&batch(&["RELIANCE", "TCS", "RELIANCE"], &[1, 2, 3])).unwrap();
+        w.write(&batch(&["RELIANCE", "TCS", "RELIANCE"], &[1, 2, 3]))
+            .unwrap();
         let summary = w.finish().unwrap();
 
         assert_eq!(summary.len(), 2);
-        let rel = root
-            .join("segment=cm/kind=orders/date=2022-01-27/symbol=RELIANCE/part-000.parquet");
+        let rel =
+            root.join("segment=cm/kind=orders/date=2022-01-27/symbol=RELIANCE/part-000.parquet");
         assert!(rel.exists(), "expected {}", rel.display());
-        assert_eq!(read_all(&rel), vec![("RELIANCE".into(), 1), ("RELIANCE".into(), 3)]);
+        assert_eq!(
+            read_all(&rel),
+            vec![("RELIANCE".into(), 1), ("RELIANCE".into(), 3)]
+        );
     }
 
     #[test]
@@ -427,7 +442,11 @@ mod tests {
 
         let rel = root.join("date=2022-01-27/symbol=RELIANCE/part-000.parquet");
         let got: Vec<i64> = read_all(&rel).into_iter().map(|(_, p)| p).collect();
-        assert_eq!(got, (0..50).collect::<Vec<_>>(), "rows must stay in arrival order");
+        assert_eq!(
+            got,
+            (0..50).collect::<Vec<_>>(),
+            "rows must stay in arrival order"
+        );
     }
 
     #[test]
@@ -440,12 +459,17 @@ mod tests {
             WriterOptions::default(),
         )
         .unwrap();
-        w.write(&batch(&["M&M", "COX&KINGS", "NIFTY-50"], &[1, 2, 3])).unwrap();
+        w.write(&batch(&["M&M", "COX&KINGS", "NIFTY-50"], &[1, 2, 3]))
+            .unwrap();
         w.finish().unwrap();
 
         assert!(root.join("date=2022-01-27/symbol=M&M/part-000.parquet").exists());
-        assert!(root.join("date=2022-01-27/symbol=COX&KINGS/part-000.parquet").exists());
-        assert!(root.join("date=2022-01-27/symbol=NIFTY-50/part-000.parquet").exists());
+        assert!(root
+            .join("date=2022-01-27/symbol=COX&KINGS/part-000.parquet")
+            .exists());
+        assert!(root
+            .join("date=2022-01-27/symbol=NIFTY-50/part-000.parquet")
+            .exists());
     }
 
     #[test]
@@ -458,29 +482,34 @@ mod tests {
     }
 
     #[test]
-    fn the_global_budget_bounds_buffered_rows() {
+    fn the_byte_budget_bounds_what_is_held_in_memory() {
         let root = tmp("nsetick_w_budget");
         let mut w = PartitionedWriter::new(
             &root,
             vec![("date".into(), "2022-01-27".into())],
             schema(),
             WriterOptions {
-                row_group_rows: 1_000_000, // never reached
-                max_buffered_rows: 10,     // so the budget is what forces flushes
+                row_group_rows: 1_000_000, // never reached, so the budget is what forces flushes
+                max_buffered_bytes: 4096,
                 ..WriterOptions::default()
             },
         )
         .unwrap();
-        for i in 0..100i64 {
+        for i in 0..500i64 {
             w.write(&batch(&["A", "B", "C"], &[i, i, i])).unwrap();
-            assert!(
-                w.buffered_rows <= 10 + 3,
-                "buffer grew to {} rows",
-                w.buffered_rows
-            );
         }
+        // The budget is enforced after each partition write, so the steady state stays near
+        // the limit rather than growing with the input.
+        assert!(
+            w.buffered_bytes <= 4096 + 64 * 1024,
+            "buffer grew to {} bytes",
+            w.buffered_bytes
+        );
         let s = w.finish().unwrap();
-        assert_eq!(s.iter().map(|p| p.rows).sum::<u64>(), 300);
+        assert_eq!(s.iter().map(|p| p.rows).sum::<u64>(), 1500);
+        // And every row still made it to disk.
+        let a = root.join("date=2022-01-27/symbol=A/part-000.parquet");
+        assert_eq!(read_all(&a).len(), 500);
     }
 
     #[test]
@@ -499,7 +528,10 @@ mod tests {
         w.write(&batch(&["RELIANCE", "TCS"], &[1, 2])).unwrap();
         let s = w.finish().unwrap();
         assert_eq!(s.len(), 1);
-        assert_eq!(read_all(&root.join("date=2022-01-27/part-000.parquet")).len(), 2);
+        assert_eq!(
+            read_all(&root.join("date=2022-01-27/part-000.parquet")).len(),
+            2
+        );
     }
 
     #[test]
@@ -516,5 +548,30 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("--select"), "{err}");
+    }
+
+    #[test]
+    fn split_preserves_row_order_within_each_group() {
+        let b = batch(
+            &["A", "B", "A", "C", "B", "A"],
+            &[1, 10, 2, 100, 20, 3],
+        );
+        let mut got: Vec<(String, Vec<i64>)> = split_by_partition(&b, 0)
+            .unwrap()
+            .into_iter()
+            .map(|(k, rb)| {
+                let c = rb.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+                (k, (0..rb.num_rows()).map(|i| c.value(i)).collect())
+            })
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            got,
+            vec![
+                ("A".to_string(), vec![1, 2, 3]),
+                ("B".to_string(), vec![10, 20]),
+                ("C".to_string(), vec![100]),
+            ]
+        );
     }
 }
