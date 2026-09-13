@@ -44,7 +44,7 @@ use crate::memory::{self, MemoryGuard};
 use crate::reader::{read_trigger, RecordReader, DEFAULT_CHUNK_BYTES};
 use crate::writer::{split_by_partition, PartitionSummary, PartitionedWriter, WriterOptions};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ParseRequest {
     pub input: PathBuf,
     pub layout_id: String,
@@ -70,6 +70,41 @@ pub struct ParseRequest {
     /// Worker threads for decoding and writing. `None` picks a default from the machine.
     /// `Some(1)` runs the whole pipeline on one thread besides the inflate.
     pub threads: Option<usize>,
+    /// Polled between chunks; returning an error stops the run and propagates it.
+    ///
+    /// A full session takes twenty minutes, and a caller has to be able to give up on it. A
+    /// Python caller cannot: the interpreter only raises KeyboardInterrupt from its eval
+    /// loop, so while the main thread sits inside this call Ctrl-C sets a flag that nothing
+    /// reads until the call returns - which is precisely what the user is trying to avoid
+    /// waiting for. The binding supplies a hook here that re-acquires the GIL briefly and
+    /// runs Python's pending signal handlers, turning Ctrl-C into a clean, prompt stop that
+    /// still closes every writer on the way out.
+    #[allow(clippy::type_complexity)]
+    pub interrupt: Option<Arc<dyn Fn() -> Result<()> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ParseRequest {
+    /// Hand-written because a boxed closure has no `Debug`; the hook is reported as present
+    /// or absent, which is all a diagnostic needs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParseRequest")
+            .field("input", &self.input)
+            .field("layout_id", &self.layout_id)
+            .field("session_date", &self.session_date)
+            .field("out_root", &self.out_root)
+            .field("select", &self.select)
+            .field("filter", &self.filter)
+            .field("strict", &self.strict)
+            .field("writer", &self.writer)
+            .field("verify_trigger", &self.verify_trigger)
+            .field("chunk_bytes", &self.chunk_bytes)
+            .field("max_records", &self.max_records)
+            .field("memory_limit", &self.memory_limit)
+            .field("note", &self.note)
+            .field("threads", &self.threads)
+            .field("interrupt", &self.interrupt.is_some())
+            .finish()
+    }
 }
 
 impl ParseRequest {
@@ -80,6 +115,7 @@ impl ParseRequest {
         out_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
+            interrupt: None,
             input: input.into(),
             layout_id: layout_id.into(),
             session_date,
@@ -445,6 +481,17 @@ fn execute(
                 }
             };
             pending.insert(decoded.seq, decoded);
+
+            // Between chunks is the right place to notice a cancellation: every worker is
+            // mid-flight but no partial row group has been committed, so breaking here still
+            // unwinds through the same shutdown path a normal finish uses and leaves no
+            // half-written file behind.
+            if let Some(check) = &req.interrupt {
+                if let Err(e) = check() {
+                    route_error = Some(e);
+                    break 'outer;
+                }
+            }
 
             while let Some(d) = pending.remove(&next_seq) {
                 next_seq += 1;

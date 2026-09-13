@@ -26,12 +26,21 @@ use arrow::pyarrow::PyArrowType;
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use pyo3::exceptions::PyValueError;
+use std::sync::Arc;
+
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 /// anyhow's chain is where the useful part of an nsetick error lives, so flatten the whole
 /// chain into the Python exception rather than showing only the outermost context.
 fn to_py_err(e: anyhow::Error) -> PyErr {
+    // An interrupt must surface as KeyboardInterrupt, not as a ValueError whose message
+    // happens to mention one: callers catch the exception type, and `run_all.py` needs to
+    // distinguish "the user stopped this" from "the stage failed".
+    let msg = format!("{e:#}");
+    if msg.contains("interrupted: KeyboardInterrupt") {
+        return pyo3::exceptions::PyKeyboardInterrupt::new_err("interrupted");
+    }
     PyValueError::new_err(format!("{e:#}"))
 }
 
@@ -72,6 +81,20 @@ fn stats_dict<'py>(py: Python<'py>, s: &Stats) -> PyResult<Bound<'py, PyDict>> {
 }
 
 /// Parse one file into partitioned Parquet.
+/// A hook the long-running stages poll so Ctrl-C works.
+///
+/// Python raises `KeyboardInterrupt` from its eval loop. While the main thread is inside a
+/// twenty-minute Rust call that loop is not running, so Ctrl-C sets a flag nobody reads until
+/// the call returns - exactly the wait the user is trying to escape. Re-acquiring the GIL
+/// briefly and running the pending handlers converts it into an error the pipeline can
+/// propagate, which unwinds through the normal shutdown path and closes every writer.
+fn interrupt_hook() -> Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync> {
+    Arc::new(|| {
+        Python::attach(|py| py.check_signals())
+            .map_err(|e| anyhow::anyhow!("interrupted: {e}"))
+    })
+}
+
 #[pyfunction]
 #[pyo3(signature = (
     input, out, *, layout=None, date=None, select=None, where_=None,
@@ -131,7 +154,9 @@ fn parse(
         ..WriterOptions::default()
     };
 
-    // Parsing a session takes minutes and touches no Python objects.
+    // Parsing a session takes minutes and touches no Python objects, beyond the periodic
+    // signal check the hook performs.
+    req.interrupt = Some(interrupt_hook());
     let report = py
         .detach(|| pipeline::run(&req))
         .map_err(to_py_err)?;
@@ -377,6 +402,7 @@ fn build_books(
             compression,
             ..WriterOptions::default()
         };
+        req.interrupt = Some(interrupt_hook());
         let r = py
             .detach(|| nsetick_book::from_parquet::run(&req))
             .map_err(to_py_err)?;
