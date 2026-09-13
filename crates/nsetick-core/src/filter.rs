@@ -54,6 +54,93 @@ impl fmt::Display for CmpOp {
     }
 }
 
+/// A set of byte-string needles, indexed for rejection rather than scanned.
+///
+/// The obvious implementation is a linear scan, and for a handful of needles it is the right
+/// one: a few short `memcmp`s beat hashing. That was the original choice here, with a comment
+/// asserting needle counts are small. Filtering a session to an index universe violates the
+/// assumption badly - 1,129 symbols against 704 million records is up to 800 billion slice
+/// comparisons, and because most records miss, nearly every one pays the full scan.
+///
+/// Needles are bucketed by their first byte and length instead. Both are available before any
+/// comparison, the pair is close to unique across an equity universe, and a miss usually
+/// lands in an empty bucket and returns without a single `memcmp`. There is no hashing on the
+/// hot path and no allocation.
+///
+/// Below `LINEAR_MAX` the flat scan is kept, because for a two-element series filter the
+/// indexing costs more than it saves.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TextSet {
+    /// Flat scan, used when the set is tiny.
+    small: Vec<Vec<u8>>,
+    /// Buckets indexed by `first_byte * stride + len`, empty when `small` is in use.
+    buckets: Vec<Vec<Vec<u8>>>,
+    stride: usize,
+    /// Needles of zero length, which have no first byte to index on.
+    has_empty: bool,
+}
+
+/// Sets no larger than this keep the flat scan.
+const LINEAR_MAX: usize = 8;
+
+impl TextSet {
+    pub fn new(needles: Vec<Vec<u8>>) -> Self {
+        let has_empty = needles.iter().any(|n| n.is_empty());
+        if needles.len() <= LINEAR_MAX {
+            return Self { small: needles, buckets: Vec::new(), stride: 0, has_empty };
+        }
+        let max_len = needles.iter().map(|n| n.len()).max().unwrap_or(0);
+        let stride = max_len + 1;
+        let mut buckets = vec![Vec::new(); 256 * stride];
+        for n in &needles {
+            if n.is_empty() {
+                continue;
+            }
+            buckets[n[0] as usize * stride + n.len()].push(n.clone());
+        }
+        Self { small: Vec::new(), buckets, stride, has_empty }
+    }
+
+    pub fn len(&self) -> usize {
+        if self.buckets.is_empty() {
+            self.small.len()
+        } else {
+            self.buckets.iter().map(|b| b.len()).sum::<usize>() + usize::from(self.has_empty)
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Every needle, for diagnostics and round-tripping a filter back to text.
+    pub fn needles(&self) -> Vec<&[u8]> {
+        if self.buckets.is_empty() {
+            self.small.iter().map(|n| n.as_slice()).collect()
+        } else {
+            self.buckets.iter().flatten().map(|n| n.as_slice()).collect()
+        }
+    }
+
+    #[inline]
+    pub fn contains(&self, value: &[u8]) -> bool {
+        if self.buckets.is_empty() {
+            return self.small.iter().any(|n| n.as_slice() == value);
+        }
+        if value.is_empty() {
+            return self.has_empty;
+        }
+        if value.len() >= self.stride {
+            // Longer than any needle, so it cannot match.
+            return false;
+        }
+        let bucket = &self.buckets[value[0] as usize * self.stride + value.len()];
+        // The common case for a filtered session: nothing shares this first byte and length,
+        // so the record is rejected without comparing any bytes.
+        !bucket.is_empty() && bucket.iter().any(|n| n.as_slice() == value)
+    }
+}
+
 /// A compiled predicate. Every variant carries resolved byte offsets.
 #[derive(Debug, Clone)]
 pub enum Predicate {
@@ -72,7 +159,7 @@ pub enum Predicate {
         offset: usize,
         len: usize,
         pad: Option<Pad>,
-        needles: Vec<Vec<u8>>,
+        set: TextSet,
         negated: bool,
     },
 
@@ -117,7 +204,7 @@ impl Predicate {
                 offset,
                 len,
                 pad,
-                needles,
+                set,
                 negated,
             } => {
                 let raw = &record[*offset..*offset + *len];
@@ -134,10 +221,7 @@ impl Predicate {
                         &raw[s..e]
                     }
                 };
-                // Needle counts are small (a handful of symbols, or a few series codes), so
-                // a linear scan of short slices beats hashing.
-                let hit = needles.iter().any(|n| n.as_slice() == value);
-                hit != *negated
+                set.contains(value) != *negated
             }
 
             Predicate::NumCmp {
@@ -425,7 +509,7 @@ impl<'a> Parser<'a> {
             offset: field.offset,
             len: field.len,
             pad: field.pad,
-            needles,
+            set: TextSet::new(needles),
             negated,
         })
     }
@@ -767,5 +851,81 @@ mod tests {
         let v = cm_orders();
         let err = format!("{:#}", compile("txn_time >= 09:15:00", &v, None).unwrap_err());
         assert!(err.contains("must be quoted"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod textset_tests {
+    use super::TextSet;
+
+    fn set(items: &[&str]) -> TextSet {
+        TextSet::new(items.iter().map(|s| s.as_bytes().to_vec()).collect())
+    }
+
+    #[test]
+    fn small_sets_use_the_flat_scan_and_still_match() {
+        let s = set(&["EQ", "BE"]);
+        assert!(s.contains(b"EQ"));
+        assert!(s.contains(b"BE"));
+        assert!(!s.contains(b"SM"));
+        assert_eq!(s.len(), 2);
+    }
+
+    #[test]
+    fn large_sets_match_exactly_what_a_linear_scan_would() {
+        // Enough needles to cross into the bucketed representation, with the first-byte and
+        // length collisions real tickers have.
+        let names: Vec<String> = (0..500)
+            .map(|i| format!("SYM{i}"))
+            .chain(["RELIANCE", "TCS", "M&M", "BAJAJ-AUTO"].iter().map(|s| s.to_string()))
+            .collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let s = set(&refs);
+
+        for n in &names {
+            assert!(s.contains(n.as_bytes()), "{n} should match");
+        }
+        for miss in ["SYM500", "RELIANC", "RELIANCEX", "", "M&", "ZZZZ"] {
+            assert!(!s.contains(miss.as_bytes()), "{miss:?} should not match");
+        }
+        assert_eq!(s.len(), names.len());
+    }
+
+    #[test]
+    fn a_value_longer_than_every_needle_is_rejected_without_scanning() {
+        let names: Vec<String> = (0..100).map(|i| format!("A{i}")).collect();
+        let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+        let s = set(&refs);
+        assert!(!s.contains(b"AAAAAAAAAAAAAAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn the_empty_needle_is_handled_in_both_representations() {
+        assert!(set(&["", "EQ"]).contains(b""));
+        let mut many: Vec<String> = (0..50).map(|i| format!("S{i}")).collect();
+        many.push(String::new());
+        let refs: Vec<&str> = many.iter().map(|s| s.as_str()).collect();
+        let s = set(&refs);
+        assert!(s.contains(b""));
+        assert!(s.contains(b"S7"));
+        assert!(!s.contains(b"S99"));
+    }
+
+    #[test]
+    fn needles_round_trip_regardless_of_representation() {
+        for n in [3usize, 40] {
+            let names: Vec<String> = (0..n).map(|i| format!("T{i}")).collect();
+            let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+            let s = set(&refs);
+            let mut got: Vec<String> = s
+                .needles()
+                .iter()
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect();
+            got.sort();
+            let mut want = names.clone();
+            want.sort();
+            assert_eq!(got, want);
+        }
     }
 }
