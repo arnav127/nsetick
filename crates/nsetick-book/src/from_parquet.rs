@@ -31,7 +31,7 @@ use crate::book::OrderBook;
 use crate::replay::{events_by_symbol, ReplayReport, REQUIRED_FIELDS};
 use crate::snapshot::{IntervalCounts, SnapshotBuilder};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ParquetReplayRequest {
     /// Directory holding the parsed orders for one session, i.e. the `date=...` directory
     /// containing `symbol=*` partitions, or a single parquet file.
@@ -44,6 +44,9 @@ pub struct ParquetReplayRequest {
     /// Restrict to these symbols. Empty means every symbol present.
     pub symbols: Vec<String>,
     pub writer: WriterOptions,
+    /// Polled between files so a long replay can be interrupted. See `ParseRequest`.
+    #[allow(clippy::type_complexity)]
+    pub interrupt: Option<std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>>,
 }
 
 impl ParquetReplayRequest {
@@ -61,6 +64,7 @@ impl ParquetReplayRequest {
             threads: None,
             symbols: Vec::new(),
             writer: WriterOptions::default(),
+            interrupt: None,
         }
     }
 }
@@ -259,6 +263,14 @@ pub fn run(req: &ParquetReplayRequest) -> Result<ReplayReport> {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= files.len() || first_error.lock().expect("err lock").is_some() {
                     break;
+                }
+                // One file per symbol, so this is a natural checkpoint: nothing is
+                // half-written and the shared writer is consistent.
+                if let Some(check) = &req.interrupt {
+                    if let Err(e) = check() {
+                        *first_error.lock().expect("err lock") = Some(e);
+                        break;
+                    }
                 }
                 match replay_file(&files[i], interval_micros, req.levels, &writer) {
                     Ok((e, f, s, r, syms, cr)) => {
