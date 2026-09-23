@@ -1,0 +1,42 @@
+name: Wiki
+
+# The wiki's source of truth is docs/wiki in this repository, where pages are reviewed like
+# code. This mirrors it to the GitHub wiki on every change.
+#
+# GitHub only creates the wiki's git repository once a first page exists, so before the first
+# run: open the repository's Wiki tab, create any page, and save it. This workflow then
+# replaces it with docs/wiki.
+
+on:
+  push:
+    branches: [main]
+    paths: ["docs/wiki/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mirror docs/wiki to the wiki
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git clone --depth 1 "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki; then
+            echo "::error::No wiki repository yet. Create any page in the Wiki tab once, then re-run this workflow."
+            exit 1
+          fi
+          rsync -a --delete --exclude .git docs/wiki/ wiki/
+          cd wiki
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "wiki already up to date"
+            exit 0
+          fi
+          git commit -m "Sync from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          git push

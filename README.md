@@ -1,6 +1,12 @@
 # nsetick
 
-Fast, correct parsing of NSE historical order and trade data into Parquet.
+[![CI](https://github.com/arnav127/nsetick/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav127/nsetick/actions/workflows/ci.yml)
+
+Fast, correct parsing of NSE historical order and trade data into Parquet, and reconstruction
+of the limit order book from it.
+
+**Documentation: [the wiki](https://github.com/arnav127/nsetick/wiki)** — installation, a quick
+start, the Python API, and how the order book replay was validated.
 
 NSE ships its historical tick data as gzipped fixed-width text. A single session of Capital
 Market orders is 8.3 GB compressed, 56 GB decompressed, and 684 million records. `nsetick`
@@ -17,7 +23,7 @@ Snappy file, all 17 columns), 8-core Windows machine:
 |---|---|---|
 | DuckDB | 22.3 s | 116 MB |
 | nsetick, same shape | **5.7 s** | 116 MB |
-| nsetick, default (ZSTD, partitioned by symbol) | 8.6 s | **72 MB** |
+| nsetick, ZSTD, partitioned by symbol | 8.6 s | **72 MB** |
 
 Both produce 7,967,699 rows with identical symbol sets and identical column checksums.
 
@@ -34,10 +40,25 @@ spec, validates it structurally, and refuses to guess when a file does not match
 
 ## Install
 
+Prebuilt, no Rust needed. The Python package (Python 3.9+; Linux, macOS, Windows):
+
+```bash
+pip install nsetick --find-links https://github.com/arnav127/nsetick/releases/expanded_assets/v0.2.0
+```
+
+The command-line binary: download the archive for your platform from the
+[releases page](https://github.com/arnav127/nsetick/releases). Linux builds are static and run
+on any distribution.
+
+From source (Rust 1.95+):
+
 ```bash
 cargo build --release
 ./target/release/nsetick --help
 ```
+
+Details, including offline installs on compute clusters, are on the
+[Installation](https://github.com/arnav127/nsetick/wiki/Installation) page.
 
 ## Use
 
@@ -97,10 +118,6 @@ WHERE symbol = 'RELIANCE';
 
 ## Python
 
-```bash
-pip install maturin && maturin develop --release
-```
-
 Stream Arrow batches straight into a process, no Parquet round trip, memory flat regardless
 of session size:
 
@@ -133,6 +150,26 @@ before an hour of parsing rather than after it.
 
 Full guide, including how to migrate the existing DuckDB parsers:
 [`docs/python.md`](docs/python.md).
+
+## Order books
+
+Replay order events into a limit order book per symbol and write periodic L2 snapshots:
+
+```bash
+nsetick book parquet/segment=cm/kind=orders/date=2022-01-27 --out books --interval 1 --levels 20
+```
+
+```python
+nsetick.build_books("parquet/segment=cm/kind=orders/date=2022-01-27", out="books", symbols=["TCS"])
+```
+
+The replay implements NSE's matching rules — disclosed-quantity orders and their replenishment
+at the back of the queue, market, IOC and stop-loss orders, and self-trade prevention — and was
+checked against the exchange's own trade file: it matches within about 0.3-2.3% of the volume
+actually traded for most securities. Snapshots carry visible and hidden quantity per level, the
+composition of the touch, and per-interval event counts. See
+[Order Book Reconstruction](https://github.com/arnav127/nsetick/wiki/Order-Book-Reconstruction)
+and [Validation and Accuracy](https://github.com/arnav127/nsetick/wiki/Validation-and-Accuracy).
 
 ## Filter language
 
@@ -177,8 +214,9 @@ recording the source file, layout version, filter, projection, note and row coun
 directory of Parquet can be traced back to what produced it.
 
 Useful knobs: `--partition-by none` for a single file per date, `-j/--threads` for worker
-count, `--compression zstd|snappy|none`, `--row-group-rows`, `--max-buffered-mb`,
-`--chunk-mb`, and `--max-records` for smoke tests on multi-gigabyte files.
+count, `--compression snappy|zstd|none` (Snappy by default; ZSTD is about a third smaller),
+`--row-group-rows`, `--data-page-kb`, `--memory-limit-mb`, `--chunk-mb`, and `--max-records`
+for smoke tests on multi-gigabyte files.
 
 ## Memory
 
@@ -236,11 +274,16 @@ fact that Capital Market files are internally split by symbol range.
 spec/layouts/*.toml     the single source of truth for every byte offset
 crates/nsetick-core     layout registry, decoder, filter engine
 crates/nsetick-io       gzip reader, partitioned Parquet writer, manifests
+crates/nsetick-book     order book replay and L2 snapshots
 crates/nsetick-cli      the nsetick binary
 crates/nsetick-py       PyO3 bindings
 python/nsetick          the Python package; reference decoder
 ```
 
+## Data
+
+NSE historical data is licensed; none is included here or can be distributed with this tool.
+
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE) and the [changelog](CHANGELOG.md).

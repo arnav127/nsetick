@@ -3,6 +3,7 @@ name = "nsetick-book"
 description = "Limit order book reconstruction and L2 snapshots for NSE order-level data"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

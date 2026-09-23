@@ -3,8 +3,9 @@ resolver = "2"
 members = ["crates/nsetick-core", "crates/nsetick-io", "crates/nsetick-cli", "crates/nsetick-py", "crates/nsetick-book"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.95"
 license = "MIT"
 repository = "https://github.com/arnav127/nsetick"
 

@@ -1,0 +1,188 @@
+name: Release
+
+# Pushing a tag like v0.2.0 builds the command-line binary and the Python wheels for every
+# supported platform and publishes them as a GitHub release. Running the workflow by hand
+# builds everything without publishing, which is how to check a release before tagging it.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: check version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # A tag that disagrees with Cargo.toml would publish wheels labelled with one
+          # version inside a release named for another.
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+  cli:
+    name: cli (${{ matrix.target }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds are static (musl) so one binary runs on any distribution, including
+          # the older enterprise Linux that university clusters commonly run.
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+          - { os: macos-14, target: aarch64-apple-darwin }
+          - { os: macos-14, target: x86_64-apple-darwin }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build
+        run: cargo build --release --locked -p nsetick-cli --target ${{ matrix.target }}
+      - name: Smoke test
+        # The cross-compiled x86_64 macOS binary cannot run on the arm64 runner.
+        if: matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          bin=target/${{ matrix.target }}/release/nsetick
+          [[ "${{ runner.os }}" == "Windows" ]] && bin="$bin.exe"
+          "$bin" --version
+          "$bin" layouts
+      - name: Package
+        shell: bash
+        run: |
+          name=nsetick-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          mkdir -p "$name"
+          cp LICENSE README.md CHANGELOG.md "$name/"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp target/${{ matrix.target }}/release/nsetick.exe "$name/"
+            7z a "$name.zip" "$name" > /dev/null
+            echo "ASSET=$name.zip" >> "$GITHUB_ENV"
+          else
+            cp target/${{ matrix.target }}/release/nsetick "$name/"
+            tar czf "$name.tar.gz" "$name"
+            echo "ASSET=$name.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  wheels:
+    name: wheel (${{ matrix.platform }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # manylinux2014 wheels need only glibc 2.17, so they install on older clusters too.
+          - { os: ubuntu-latest, platform: linux-x86_64, target: x86_64, manylinux: "2014" }
+          - { os: ubuntu-24.04-arm, platform: linux-aarch64, target: aarch64, manylinux: "2014" }
+          - { os: macos-14, platform: macos-arm64, target: aarch64 }
+          - { os: macos-14, platform: macos-x86_64, target: x86_64 }
+          - { os: windows-latest, platform: windows-x86_64, target: x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist
+      - name: Smoke test
+        if: matrix.platform != 'macos-x86_64'
+        shell: bash
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import nsetick; print(nsetick.__version__, nsetick.layouts())"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.platform }}
+          path: dist/*.whl
+
+  sdist:
+    name: sdist
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  release:
+    name: publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: [version, cli, wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums and notes
+        shell: bash
+        run: |
+          cd artifacts && sha256sum * > SHA256SUMS && cd ..
+          # This version's section of the changelog becomes the release notes.
+          awk -v v="## ${{ needs.version.outputs.version }}" '
+            $0 == v {on=1; next} /^## / && on {exit} on' CHANGELOG.md > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: nsetick ${{ needs.version.outputs.version }}
+          body_path: notes.md
+          files: artifacts/*
+
+  pypi:
+    name: publish to PyPI
+    # Off until a trusted publisher is configured on pypi.org and the repository variable
+    # PYPI_PUBLISH is set to true. See the Releasing page of the wiki.
+    if: github.ref_type == 'tag' && vars.PYPI_PUBLISH == 'true'
+    needs: [release]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "{wheel-*,sdist}"
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1

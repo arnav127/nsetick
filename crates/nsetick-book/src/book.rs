@@ -71,7 +71,8 @@ pub struct OrderEvent {
     pub price: i64,
     pub volume_disclosed: i64,
     pub volume_original: i64,
-    /// Timestamp in the feed's own units (jiffies), kept opaque here.
+    /// Microseconds since the Unix epoch, as decoded from the feed's jiffies. Intervals and
+    /// the self-trade-prevention window are measured in these units.
     pub timestamp: i64,
     pub algo_indicator: u8,
     pub client_identity: u8,

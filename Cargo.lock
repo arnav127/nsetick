@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-book"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -806,7 +806,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arrow",

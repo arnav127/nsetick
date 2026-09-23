@@ -2,14 +2,20 @@
 
 ## Install
 
-From a checkout:
+Prebuilt wheels are attached to every [release](https://github.com/arnav127/nsetick/releases):
+
+```bash
+pip install nsetick --find-links https://github.com/arnav127/nsetick/releases/expanded_assets/v0.2.0
+```
+
+From a checkout, to work on nsetick itself:
 
 ```bash
 pip install maturin
 maturin develop --release        # into the active environment
 # or build a wheel to install elsewhere
 maturin build --release
-pip install target/wheels/nsetick-0.1.0-cp39-abi3-win_amd64.whl
+pip install target/wheels/nsetick-*.whl
 ```
 
 The wheel is `abi3`, so one build works on Python 3.9 and every later version.

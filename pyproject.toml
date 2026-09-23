@@ -25,4 +25,8 @@ python-source = "python"
 features = ["pyo3/extension-module"]
 # The layout specs ship inside the wheel so the pure-Python reference decoder works from an
 # installed package, not only from a source checkout.
-include = [{ path = "spec/layouts/*.toml", format = ["sdist", "wheel"] }]
+include = [
+    { path = "spec/layouts/*.toml", format = ["sdist", "wheel"] },
+    { path = "LICENSE", format = "sdist" },
+    { path = "CHANGELOG.md", format = "sdist" },
+]

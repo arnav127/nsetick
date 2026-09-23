@@ -3,6 +3,7 @@ name = "nsetick-io"
 description = "Gzip reading and partitioned Parquet writing for NSE historical tick data"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 

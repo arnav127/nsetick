@@ -3,6 +3,7 @@ name = "nsetick-core"
 description = "Layout registry and fixed-width decoder for NSE historical order and trade data"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
