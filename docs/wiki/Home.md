@@ -55,11 +55,3 @@ Capital Market orders.
 
 NSE historical data is licensed. `nsetick` contains no data and none can be distributed with
 it; obtain the files through your institution's NSE data subscription.
-
-## Citing
-
-If you use `nsetick` in published work, please cite the repository:
-`Dixit, A. nsetick: parsing and order book reconstruction for NSE historical tick data.
-https://github.com/arnav127/nsetick`, with the version you used (`nsetick --version`). Book
-reconstruction changed materially in 0.2.0; see the
-[changelog](https://github.com/arnav127/nsetick/blob/main/CHANGELOG.md).

@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If you use nsetick in your research, please cite it with the version you used."
+title: "nsetick: parsing and order book reconstruction for NSE historical tick data"
+type: software
+authors:
+  - family-names: Dixit
+    given-names: Arnav
+repository-code: "https://github.com/arnav127/nsetick"
+url: "https://github.com/arnav127/nsetick/wiki"
+license: MIT
+version: 0.2.1
+date-released: "2026-09-24"
+keywords:
+  - NSE
+  - market microstructure
+  - limit order book
+  - tick data
+  - parquet

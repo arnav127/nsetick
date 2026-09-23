@@ -232,15 +232,6 @@ for a full session takes about 8 minutes on 8 cores. See
 NSE historical data is licensed. nsetick contains no data and none can be shared with it.
 Obtain the files through your institution's NSE subscription.
 
-## Citing
-
-If nsetick helps your research, please cite it with the version you used:
-
-> Dixit, A. *nsetick: parsing and order book reconstruction for NSE historical tick data.*
-> https://github.com/arnav127/nsetick
-
-Order book output changed materially in 0.2.0; see the [changelog](CHANGELOG.md).
-
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
