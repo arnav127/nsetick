@@ -8,6 +8,7 @@ pub mod book;
 pub mod from_parquet;
 pub mod replay;
 pub mod snapshot;
+pub mod stream;
 
 pub use book::{BookStats, Fill, OrderBook, OrderEvent, Side, CANCEL, ENTRY, MODIFY};
 pub use from_parquet::ParquetReplayRequest;

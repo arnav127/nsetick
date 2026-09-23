@@ -27,9 +27,9 @@ use nsetick_io::writer::{PartitionedWriter, WriterOptions};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 
-use crate::book::OrderBook;
-use crate::replay::{events_by_symbol, ReplayReport, REQUIRED_FIELDS};
-use crate::snapshot::{IntervalCounts, SnapshotBuilder};
+use crate::stream::{Progress, SymbolReplay};
+use crate::replay::{events_by_symbol, ReplayReport, OPTIONAL_FIELDS, REQUIRED_FIELDS};
+use crate::snapshot::SnapshotBuilder;
 
 #[derive(Clone)]
 pub struct ParquetReplayRequest {
@@ -119,12 +119,16 @@ fn read_projected(path: &Path) -> Result<Vec<RecordBatch>> {
     // Project by name so a file with extra columns, or columns in another order, still works.
     let schema = builder.parquet_schema();
     let mut indices = Vec::new();
+    let mut required_found = 0;
     for (i, col) in schema.columns().iter().enumerate() {
         if REQUIRED_FIELDS.contains(&col.name()) {
             indices.push(i);
+            required_found += 1;
+        } else if OPTIONAL_FIELDS.contains(&col.name()) {
+            indices.push(i);
         }
     }
-    if indices.len() != REQUIRED_FIELDS.len() {
+    if required_found != REQUIRED_FIELDS.len() {
         let present: Vec<&str> = schema.columns().iter().map(|c| c.name()).collect();
         let missing: Vec<&&str> = REQUIRED_FIELDS
             .iter()
@@ -164,37 +168,16 @@ fn replay_file(
 
     // A single partition file holds one symbol, but a flat file may hold many, so key by
     // symbol rather than assuming.
-    let mut books: std::collections::HashMap<String, (OrderBook, i64, crate::book::BookStats)> =
-        std::collections::HashMap::new();
-
-    let mut events = 0u64;
-    let mut fills = 0u64;
-    let mut snaps = 0u64;
-    let mut replen = 0u64;
-    let mut crossed = 0usize;
+    let mut books: std::collections::HashMap<String, SymbolReplay> = std::collections::HashMap::new();
+    let mut progress = Progress::default();
 
     for batch in &batches {
         for (sym, evs) in events_by_symbol(batch)? {
-            let entry = books.entry(sym.clone()).or_insert_with(|| {
-                (OrderBook::new(sym.clone()), i64::MIN, Default::default())
-            });
+            let replay = books
+                .entry(sym.clone())
+                .or_insert_with(|| SymbolReplay::new(sym.clone()));
             for ev in &evs {
-                if entry.1 == i64::MIN {
-                    entry.1 = ev.timestamp + interval_micros;
-                }
-                while ev.timestamp >= entry.1 {
-                    let now = entry.0.stats();
-                    builder.push_with(
-                        &entry.0,
-                        entry.1,
-                        IntervalCounts::between(&entry.2, &now),
-                    );
-                    entry.2 = now;
-                    entry.1 += interval_micros;
-                    snaps += 1;
-                }
-                fills += entry.0.apply(ev) as u64;
-                events += 1;
+                progress += replay.feed(ev, &mut builder, interval_micros);
             }
         }
         if builder.rows() >= 8192 {
@@ -202,19 +185,24 @@ fn replay_file(
             writer.lock().expect("writer lock").write(&b)?;
         }
     }
+    for replay in books.values_mut() {
+        progress += replay.finish(&mut builder, interval_micros);
+    }
 
     if builder.rows() > 0 {
         let b = builder.finish()?;
         writer.lock().expect("writer lock").write(&b)?;
     }
 
-    for (_, (book, _, _)) in books.iter() {
-        replen += book.stats().replenishments;
-        if book.is_crossed() {
+    let mut replen = 0u64;
+    let mut crossed = 0usize;
+    for replay in books.values() {
+        replen += replay.book.stats().replenishments;
+        if replay.book.is_crossed() {
             crossed += 1;
         }
     }
-    Ok((events, fills, snaps, replen, books.len(), crossed))
+    Ok((progress.events, progress.fills, progress.snapshots, replen, books.len(), crossed))
 }
 
 pub fn run(req: &ParquetReplayRequest) -> Result<ReplayReport> {

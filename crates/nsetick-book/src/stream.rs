@@ -1,0 +1,163 @@
+//! Drive one symbol's book from its event stream, emitting periodic snapshots.
+//!
+//! Both replay paths - from the raw feed and from parsed parquet - do the same thing per
+//! symbol: advance the snapshot clock to each event, capture the book as of each boundary it
+//! crosses, then apply the event. This holds that loop in one place, together with the short
+//! lookahead the book needs to recognise self-trade prevention: each event is announced to
+//! the book as soon as it is read but applied only once the stream has moved
+//! [`SELF_TRADE_WINDOW_MICROS`] past it, so a cancel the exchange issued a few hundred
+//! microseconds after a match is already known when that match is considered.
+
+use std::collections::VecDeque;
+
+use crate::book::{BookStats, OrderBook, OrderEvent, SELF_TRADE_WINDOW_MICROS};
+use crate::snapshot::{IntervalCounts, SnapshotBuilder};
+
+/// Totals from driving a book, summed by the caller across symbols.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Progress {
+    pub events: u64,
+    pub fills: u64,
+    pub snapshots: u64,
+}
+
+impl std::ops::AddAssign for Progress {
+    fn add_assign(&mut self, o: Self) {
+        self.events += o.events;
+        self.fills += o.fills;
+        self.snapshots += o.snapshots;
+    }
+}
+
+pub struct SymbolReplay {
+    pub book: OrderBook,
+    /// Next snapshot boundary, in the feed's microseconds; `None` until the first event.
+    next_snapshot: Option<i64>,
+    /// Cumulative stats as of the previous snapshot, for per-interval deltas.
+    last_stats: BookStats,
+    /// Events read and announced but not yet applied.
+    pending: VecDeque<OrderEvent>,
+    lookahead_micros: i64,
+}
+
+impl SymbolReplay {
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self::with_lookahead(symbol, SELF_TRADE_WINDOW_MICROS)
+    }
+
+    /// A lookahead of zero applies every event as it is read, which disables self-trade
+    /// prevention and reproduces the book of earlier releases.
+    pub fn with_lookahead(symbol: impl Into<String>, lookahead_micros: i64) -> Self {
+        Self {
+            book: OrderBook::new(symbol),
+            next_snapshot: None,
+            last_stats: BookStats::default(),
+            pending: VecDeque::new(),
+            lookahead_micros: lookahead_micros.max(0),
+        }
+    }
+
+    /// Read one event. Applies every buffered event the stream has now moved far enough past.
+    pub fn feed(&mut self, ev: &OrderEvent, builder: &mut SnapshotBuilder, interval: i64) -> Progress {
+        self.book.announce(ev);
+        self.pending.push_back(*ev);
+        let mut p = Progress::default();
+        while let Some(front) = self.pending.front() {
+            if front.timestamp + self.lookahead_micros >= ev.timestamp && self.lookahead_micros > 0 {
+                break;
+            }
+            let next = self.pending.pop_front().expect("front exists");
+            p += self.apply(&next, builder, interval);
+        }
+        p
+    }
+
+    /// The stream has ended: apply everything still buffered.
+    pub fn finish(&mut self, builder: &mut SnapshotBuilder, interval: i64) -> Progress {
+        let mut p = Progress::default();
+        while let Some(next) = self.pending.pop_front() {
+            p += self.apply(&next, builder, interval);
+        }
+        p
+    }
+
+    fn apply(&mut self, ev: &OrderEvent, builder: &mut SnapshotBuilder, interval: i64) -> Progress {
+        let mut p = Progress {
+            events: 1,
+            ..Default::default()
+        };
+        let next = self.next_snapshot.get_or_insert(ev.timestamp + interval);
+        // Snapshot the state *before* applying an event that crosses the boundary, so a
+        // snapshot reflects the book as of that instant.
+        while ev.timestamp >= *next {
+            let now = self.book.stats();
+            builder.push_with(&self.book, *next, IntervalCounts::between(&self.last_stats, &now));
+            self.last_stats = now;
+            *next += interval;
+            p.snapshots += 1;
+        }
+        p.fills = self.book.apply(ev) as u64;
+        p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::book::{Side, CANCEL, ENTRY};
+
+    fn event(activity: u8, id: u64, side: Side, price: i64, qty: i64, ts: i64) -> OrderEvent {
+        OrderEvent {
+            activity_type: activity,
+            order_number: id,
+            side,
+            price,
+            volume_disclosed: 0,
+            volume_original: qty,
+            timestamp: ts,
+            algo_indicator: 1,
+            client_identity: 3,
+            ioc: false,
+            market: false,
+            stop_loss: false,
+            trigger_price: 0,
+        }
+    }
+
+    #[test]
+    fn lookahead_lets_a_later_cancel_prevent_a_self_trade() {
+        let mut r = SymbolReplay::new("TEST");
+        let mut sb = SnapshotBuilder::new(1);
+        let events = [
+            event(ENTRY, 1, Side::Buy, 100_00, 10, 1_000),
+            event(ENTRY, 2, Side::Sell, 100_00, 10, 5_000),
+            event(CANCEL, 1, Side::Buy, 0, 0, 5_150),
+        ];
+        let mut p = Progress::default();
+        for e in &events {
+            p += r.feed(e, &mut sb, 1_000_000);
+        }
+        p += r.finish(&mut sb, 1_000_000);
+        assert_eq!(p.events, 3, "every event is applied once, including the buffered tail");
+        assert_eq!(p.fills, 0, "the buy was cancelled by the exchange as the sell arrived");
+        assert_eq!(r.book.stats().self_trade_preventions, 1);
+        assert_eq!(r.book.best_ask(), Some(100_00), "the sell rests");
+    }
+
+    #[test]
+    fn zero_lookahead_reproduces_the_plain_book() {
+        let mut r = SymbolReplay::with_lookahead("TEST", 0);
+        let mut sb = SnapshotBuilder::new(1);
+        let mut p = Progress::default();
+        for e in [
+            event(ENTRY, 1, Side::Buy, 100_00, 10, 1_000),
+            event(ENTRY, 2, Side::Sell, 100_00, 10, 5_000),
+            event(CANCEL, 1, Side::Buy, 0, 0, 5_150),
+        ] {
+            p += r.feed(&e, &mut sb, 1_000_000);
+        }
+        p += r.finish(&mut sb, 1_000_000);
+        assert_eq!(p.fills, 1);
+        assert_eq!(r.book.stats().self_trade_preventions, 0);
+    }
+}

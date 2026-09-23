@@ -19,7 +19,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use arrow::array::{Array, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array, UInt8Array};
+use arrow::array::{
+    Array, BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array, UInt8Array,
+};
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
 use nsetick_core::decode::{DecodeOptions, Decoder, Stats};
@@ -30,7 +32,8 @@ use nsetick_io::pipeline;
 use nsetick_io::reader::RecordReader;
 use nsetick_io::writer::{PartitionedWriter, WriterOptions};
 
-use crate::book::{OrderBook, OrderEvent, Side};
+use crate::book::{OrderEvent, Side};
+use crate::stream::SymbolReplay;
 use crate::snapshot::SnapshotBuilder;
 
 /// Columns the replay needs from the orders feed. Projecting to just these is a large part of
@@ -47,6 +50,17 @@ pub const REQUIRED_FIELDS: &[&str] = &[
     "algo_indicator",
     "client_identity",
 ];
+
+/// Order-type flags the book needs to match correctly, read when the input carries them.
+///
+/// Optional rather than required for two reasons: the currency-derivatives layout has no
+/// `ioc_flag`, and parquet written by an earlier release projected only the fields above. A
+/// replay without them falls back to treating every order as a resting limit order, which is
+/// what every release before this one did - and which the trade-file comparison showed to be
+/// wrong in two directions: market orders (price 0 in the feed) were rejected outright, so
+/// the liquidity they consumed stayed in the book, and stop-loss orders rested at their limit
+/// before they had triggered, so other orders filled against liquidity that did not yet exist.
+pub const OPTIONAL_FIELDS: &[&str] = &["ioc_flag", "mkt_order_flag", "stop_loss_flag", "trigger_price"];
 
 #[derive(Debug, Clone)]
 pub struct ReplayRequest {
@@ -119,15 +133,6 @@ fn shard_of(key: &str, shards: usize) -> usize {
     (h.finish() % shards as u64) as usize
 }
 
-/// One symbol's book plus the snapshot clock that drives its output.
-struct SymbolState {
-    book: OrderBook,
-    /// Next snapshot boundary, in microseconds since the Unix epoch.
-    next_snapshot: i64,
-    /// Cumulative stats as of the previous snapshot, for per-interval deltas.
-    last_stats: crate::book::BookStats,
-}
-
 /// Decoded events for one chunk, grouped by destination shard.
 struct Decoded {
     seq: u64,
@@ -136,7 +141,7 @@ struct Decoded {
 }
 
 /// Pull the typed columns out of a decoded batch and group events by symbol.
-pub(crate) fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<OrderEvent>)>> {
+pub fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<OrderEvent>)>> {
     macro_rules! col {
         ($name:literal, $ty:ty) => {
             batch
@@ -158,6 +163,21 @@ pub(crate) fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<O
     let original = col!("volume_original", UInt64Array);
     let algo = col!("algo_indicator", UInt8Array);
     let client = col!("client_identity", UInt8Array);
+
+    // Optional: absent columns read as false / zero, which reproduces the plain-limit-order
+    // behaviour of earlier releases rather than failing the replay.
+    let flag = |name: &str| {
+        batch
+            .column_by_name(name)
+            .and_then(|c| c.as_any().downcast_ref::<BooleanArray>())
+    };
+    let ioc = flag("ioc_flag");
+    let market = flag("mkt_order_flag");
+    let stop = flag("stop_loss_flag");
+    let trigger = batch
+        .column_by_name("trigger_price")
+        .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
+    let is_set = |a: Option<&BooleanArray>, i: usize| a.is_some_and(|a| !a.is_null(i) && a.value(i));
 
     let mut out: Vec<(String, Vec<OrderEvent>)> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
@@ -181,6 +201,10 @@ pub(crate) fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<O
             timestamp: time.value(i),
             algo_indicator: if algo.is_null(i) { 255 } else { algo.value(i) },
             client_identity: if client.is_null(i) { 255 } else { client.value(i) },
+            ioc: is_set(ioc, i),
+            market: is_set(market, i),
+            stop_loss: is_set(stop, i),
+            trigger_price: trigger.map_or(0, |t| if t.is_null(i) { 0 } else { t.value(i) }),
         };
 
         let sym = symbol.value(i);
@@ -210,7 +234,11 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
         .with_context(|| format!("probing {}", req.input.display()))?;
     let version = lay.resolve(req.session_date, Some(observed))?.clone();
 
-    let select: Vec<String> = REQUIRED_FIELDS.iter().map(|s| s.to_string()).collect();
+    let select: Vec<String> = REQUIRED_FIELDS
+        .iter()
+        .chain(OPTIONAL_FIELDS.iter().filter(|f| version.field(f).is_some()))
+        .map(|s| s.to_string())
+        .collect();
     let decoder = Arc::new(Decoder::new(
         &version,
         Some(&select),
@@ -331,45 +359,34 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
                 let mut writer =
                     PartitionedWriter::with_budget(root, prefix, sb.schema(), opts, guard)?;
                 let mut builder = sb;
-                let mut books: HashMap<String, SymbolState> = HashMap::new();
+                let mut books: HashMap<String, SymbolReplay> = HashMap::new();
                 let mut outcome = ShardOutcome::default();
 
                 for group in rx.iter() {
                     for (sym, events) in group {
-                        let st = books.entry(sym.clone()).or_insert_with(|| SymbolState {
-                            book: OrderBook::new(sym.clone()),
-                            // Align the first boundary to the first event seen.
-                            next_snapshot: i64::MIN,
-                            last_stats: Default::default(),
-                        });
+                        let st = books
+                            .entry(sym.clone())
+                            .or_insert_with(|| SymbolReplay::new(sym.clone()));
                         for ev in &events {
-                            if st.next_snapshot == i64::MIN {
-                                st.next_snapshot = ev.timestamp + interval_micros;
-                            }
-                            // Snapshot the state *before* applying an event that crosses the
-                            // boundary, so a snapshot reflects the book as of that instant.
-                            while ev.timestamp >= st.next_snapshot {
-                                let now = st.book.stats();
-                                builder.push_with(
-                                    &st.book,
-                                    st.next_snapshot,
-                                    crate::snapshot::IntervalCounts::between(&st.last_stats, &now),
-                                );
-                                st.last_stats = now;
-                                st.next_snapshot += interval_micros;
-                                outcome.snapshots += 1;
-                            }
-                            outcome.fills += st.book.apply(ev) as u64;
+                            let p = st.feed(ev, &mut builder, interval_micros);
+                            outcome.fills += p.fills;
+                            outcome.snapshots += p.snapshots;
                         }
                         if builder.rows() >= 8192 {
+                            // Several symbols can share this builder, so let the writer split
+                            // the rows by symbol rather than assuming one partition.
                             let batch = builder.finish()?;
-                            writer.write_partition(&sym, batch)?;
+                            writer.write(&batch)?;
                         }
                     }
                 }
 
-                // Flush the tail. Rows for several symbols can be mixed in the builder here,
-                // so let the writer split them rather than assuming one partition.
+                // Apply what the lookahead still holds, then flush the tail.
+                for st in books.values_mut() {
+                    let p = st.finish(&mut builder, interval_micros);
+                    outcome.fills += p.fills;
+                    outcome.snapshots += p.snapshots;
+                }
                 if builder.rows() > 0 {
                     let batch = builder.finish()?;
                     writer.write(&batch)?;

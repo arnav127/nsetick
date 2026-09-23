@@ -310,6 +310,10 @@ mod tests {
             timestamp: id as i64,
             algo_indicator: 1,
             client_identity: 3,
+            ioc: false,
+            market: false,
+            stop_loss: false,
+            trigger_price: 0,
         }
     }
 
