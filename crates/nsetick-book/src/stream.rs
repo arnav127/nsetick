@@ -61,6 +61,12 @@ impl SymbolReplay {
     }
 
     /// Keep every fill the replay generates, for [`SymbolReplay::take_fills`].
+    /// Previous session's close for this symbol, to break a tie between auction prices.
+    pub fn with_previous_close(mut self, price: Option<i64>) -> Self {
+        self.book.set_previous_close(price);
+        self
+    }
+
     pub fn record_fills(mut self) -> Self {
         self.recorded = Some(Vec::new());
         self
@@ -133,6 +139,9 @@ impl SymbolReplay {
 
 #[cfg(test)]
 mod tests {
+    /// 10:00 in the continuous session; earlier times belong to the pre-open auction.
+    const T0: i64 = 10 * 3600 * 1_000_000;
+
     use super::*;
     use crate::book::{Side, CANCEL, ENTRY};
 
@@ -144,7 +153,7 @@ mod tests {
             price,
             volume_disclosed: 0,
             volume_original: qty,
-            timestamp: ts,
+            timestamp: T0 + ts,
             algo_indicator: 1,
             client_identity: 3,
             ioc: false,

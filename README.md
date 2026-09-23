@@ -12,9 +12,10 @@ Market orders is about 8 GB compressed and 700 million records. `nsetick` reads 
 - **Parse** a session to Parquet in minutes, keeping only the rows and columns you ask for.
 - **Stream** straight into pandas, Polars, PyArrow or DuckDB, without writing anything to disk.
 - **Rebuild the order book** at any interval: depth, spreads, and the hidden quantity behind
-  iceberg orders, following NSE's matching rules.
+  iceberg orders, following NSE's matching rules from the opening auction to the close.
 - **Trust the output.** Every byte offset is defined once and checked against each file. The
-  rebuilt book reproduces 94% of the exchange's actual trades exactly, order for order.
+  rebuilt book reproduces the exchange's own trade records exactly: every one of 33 million
+  trades checked, order for order.
 
 It works as a command-line tool and as a Python package. You don't need Rust or a compiler.
 
@@ -156,8 +157,9 @@ quantity behind iceberg orders at each level, the make-up of the best quote (alg
 institutional, iceberg), and counts of what happened since the previous snapshot. See
 [Order Book Reconstruction](https://github.com/arnav127/nsetick/wiki/Order-Book-Reconstruction).
 
-The book follows NSE's rules, including the non-obvious ones: market orders, IOC, stop-loss,
-iceberg replenishment, and self-trade prevention. The
+The book follows NSE's rules, including the non-obvious ones: the pre-open call auction,
+market orders, IOC, stop-loss, iceberg tranches and their priority, self-trade prevention, and
+the post-close session. The
 [Matching Engine](https://github.com/arnav127/nsetick/wiki/Matching-Engine) page explains each
 step with diagrams.
 
@@ -170,9 +172,8 @@ for the rebuilt book, so you can compare them directly:
 fills = nsetick.replay_fills("data/parquet/segment=cm/kind=orders/date=2022-01-25", symbols=["TCS"])
 ```
 
-Over 33 million trades (24 sessions, 10 large stocks), the rebuilt book reproduces **94%** of
-trades exactly (same two orders, price and quantity). **99.2%** of orders execute exactly the
-quantity the exchange executed. See
+Over 24 sessions and 10 large stocks, **every one of the exchange's 33 million trade records**
+is reproduced: the same two orders, the same price, the same quantity. See
 [Validation and Accuracy](https://github.com/arnav127/nsetick/wiki/Validation-and-Accuracy).
 
 ### Keep a study reproducible

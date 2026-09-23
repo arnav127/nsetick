@@ -67,7 +67,7 @@ Runs every job in a JSON run spec. See [Parsing](Parsing#run-specs).
 
 ## Order books
 
-### `build_books(input, out, *, date=None, where=None, interval_secs=1.0, levels=20, threads=None, compression="snappy", max_records=None, symbols=None)` → `dict`
+### `build_books(input, out, *, date=None, where=None, interval_secs=1.0, levels=20, threads=None, compression="snappy", max_records=None, symbols=None, previous_close=None)` → `dict`
 
 Replays order events into a limit order book per symbol and writes periodic snapshots as
 Parquet, partitioned by symbol.
@@ -78,13 +78,16 @@ Parquet, partitioned by symbol.
 - `levels`: price levels captured per side.
 - `symbols`: restrict parsed input to these symbols.
 - `where`: filter applied to raw input (default `series == 'EQ'`).
+- `previous_close`: `{symbol: price_in_paise}`, each symbol's previous closing price. Only used
+  to break a tie between equally good pre-open auction prices; see
+  [Order Book Reconstruction](Order-Book-Reconstruction#what-the-replay-needs-from-you).
 
 Returns a report with `symbols`, `snapshots`, `events_applied`, `fills_generated`,
 `replenishments`, `crossed_symbols` and timings. See
 [Order Book Reconstruction](Order-Book-Reconstruction) for the output columns and the matching
 rules.
 
-### `replay_fills(input, *, symbols=None)` → `pyarrow.Table`
+### `replay_fills(input, *, symbols=None, previous_close=None)` → `pyarrow.Table`
 
 Replays parsed orders and returns **every trade the replay generates**, one row per trade,
 named like the exchange's trade file so the two can be joined:
@@ -100,6 +103,9 @@ named like the exchange's trade file so the two can be joined:
 
 - `input`: a parsed-orders `date=...` directory, or one `part-*.parquet` file.
 - `symbols`: restrict to these symbols (all if omitted).
+- `previous_close`: as for `build_books`.
+
+Auction trades are included, stamped at the last pre-open event.
 
 The exchange stamps each of its trade records slightly after the order that caused it (one
 tick of about 15 µs per trade), so join on the order numbers, not on time.

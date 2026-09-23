@@ -52,38 +52,47 @@ which is why they are captured here.
 
 ## Matching rules
 
-The replay follows NSE's matching rules, including the exchange-specific ones: market orders
-priced at zero, IOC remainders that never rest, stop-loss orders held until the feed reports
-their trigger, self-trade prevention, disclosed-quantity (iceberg) orders whose new tranches
-lose priority, and modifies that keep or lose queue position. The
-**[Matching Engine](Matching-Engine)** page explains every step, with diagrams and a worked
-example.
+The replay follows NSE's matching rules through the whole day, and reproduces the exchange's
+own trade records essentially exactly. The **[Matching Engine](Matching-Engine)** page explains
+every step, with diagrams and a worked example. In short:
 
-In short:
-
-- **Price-time priority**, with every fill at the resting order's price.
-- An order that can trade on arrival does so at once. Whatever is left **rests** at the back
-  of its price's queue, unless it is IOC or a market order, in which case it is **discarded**.
-- **Icebergs** show one tranche at a time. Each new tranche goes to the back of the queue.
-- A **modify** that only lowers the quantity keeps the order's place. Any other modify is
-  cancel-then-enter.
+- **Pre-open call auction** (09:00 to about 09:08): orders are collected, then matched at one
+  equilibrium price; what is left forms the opening book.
+- **Continuous session** (09:15 to 15:30): price-time priority, every fill at the resting
+  order's price. An order that can trade on arrival does so at once; what is left rests at
+  the back of its price's queue, unless it is IOC or a market order, in which case it is
+  discarded.
+- **Icebergs** show one tranche at a time; the exchange counts each tranche down trade by
+  trade, and a fresh tranche goes to the back of the queue.
+- A **modify** keeps the order's place unless it changes the price or makes the order show
+  more.
 - **Stop-loss** orders wait off the book until the feed's trigger record.
-- **Self-trade prevention**: a resting order the exchange cancelled when a same-client order
-  reached it is withdrawn, not traded.
+- **Self-trade prevention**: when an order reaches one of the same client's, the exchange
+  cancels one of them, and the replay does the same.
+- **Post-close session** (from 15:40): every order trades at the closing price, in time order.
 
-## What the replay cannot know
+## What the replay needs from you
 
-- **Pre-open auction.** Orders entered 09:00–09:08 are matched by call auction at a single
-  price. The replay matches them continuously as they arrive, so the book before 09:15 is
-  approximate. Use snapshots from 09:15 onward.
-- **Iceberg continuation.** When an incoming order uses up an iceberg's visible tranche, the
-  exchange sometimes continues into the same iceberg's next tranche and sometimes moves on to
-  the next order. The replay always moves on. This changes who trades with whom for a few
-  percent of trades. It rarely changes depth or how much each order executes.
+Nothing, in practice. The one input a day's files lack is the **previous day's close**: when two
+prices are equally good for the pre-open auction, the exchange picks the one closest to it. The
+replay normally reads the exchange's choice from the feed instead (moments after the auction,
+the exchange converts unfilled market orders into limit orders at that price), and in all 240
+security-sessions checked that settled every tie. If an auction ties and leaves nothing to
+convert, pass the previous close:
 
-Measured against the exchange's trade file over 33 million trades, the replay reproduces
-**94%** of trades exactly (same buy order, sell order, price and quantity), and **99.2%** of
-orders execute exactly the right quantity. See [Validation and Accuracy](Validation-and-Accuracy).
+```python
+nsetick.build_books(orders, out="books", previous_close={"TCS": 376990, "INFY": 172215})
+```
+
+```bash
+nsetick book ORDERS_DIR --out books --previous-close closes.csv   # lines of symbol,price (paise)
+```
+
+Without it, such a tie takes the lowest candidate price. Only the auction's trade price is
+affected; the book it leaves behind is the same.
+
+See [Validation and Accuracy](Validation-and-Accuracy) for how closely the replay matches the
+exchange.
 
 ## Choosing the interval and depth
 

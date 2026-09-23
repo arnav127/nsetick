@@ -18,7 +18,7 @@ It is a command-line tool and a Python package, built on a Rust core.
 | **Parse** | `.DAT.gz` to partitioned Parquet, 3–4x faster than DuckDB fixed-width parsing, with a filter language that runs before any column is built |
 | **Stream** | Arrow batches into pandas, Polars or DuckDB without writing to disk, at constant memory |
 | **Reconstruct books** | Periodic L2 snapshots from order-level events, honouring disclosed quantity, market, IOC and stop-loss orders, and self-trade prevention |
-| **Verify** | Every byte offset lives in one versioned spec, checked against each file's record length; the replay reproduces 94% of NSE's trades exactly, order for order |
+| **Verify** | Every byte offset lives in one versioned spec, checked against each file's record length; the replay reproduces NSE's own trade records exactly, order for order |
 
 ## Start here
 

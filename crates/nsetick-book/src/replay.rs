@@ -83,6 +83,9 @@ pub struct ReplayRequest {
     pub chunk_bytes: usize,
     pub max_records: Option<u64>,
     pub writer: WriterOptions,
+    /// Previous session's closing price per symbol, in paise. Only used to break a tie between
+    /// equally good pre-open auction prices; see [`crate::book::OrderBook::set_previous_close`].
+    pub previous_close: HashMap<String, i64>,
 }
 
 impl ReplayRequest {
@@ -102,6 +105,7 @@ impl ReplayRequest {
             chunk_bytes: 8 * 1024 * 1024,
             max_records: None,
             writer: WriterOptions::default(),
+            previous_close: HashMap::new(),
         }
     }
 }
@@ -371,6 +375,7 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
             let opts = req.writer.clone();
             let levels = req.levels;
             let guard = Arc::clone(&guard);
+            let previous_close = req.previous_close.clone();
             workers.push(scope.spawn(move || -> Result<ShardOutcome> {
                 let prefix = vec![
                     ("segment".to_string(), "cm".to_string()),
@@ -386,9 +391,10 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
 
                 for group in rx.iter() {
                     for (sym, events) in group {
-                        let st = books
-                            .entry(sym.clone())
-                            .or_insert_with(|| SymbolReplay::new(sym.clone()));
+                        let st = books.entry(sym.clone()).or_insert_with(|| {
+                            SymbolReplay::new(sym.clone())
+                                .with_previous_close(previous_close.get(&sym).copied())
+                        });
                         for ev in &events {
                             let p = st.feed(ev, &mut builder, interval_micros);
                             outcome.fills += p.fills;

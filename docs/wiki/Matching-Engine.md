@@ -9,9 +9,10 @@ NSE-specific quirks that decide whether the rebuilt book is right.
 
 The test of correctness is the exchange's own **trade file**. It lists every execution with
 the order number of the buyer and of the seller. The engine produces the same kind of record,
-so the two can be compared trade by trade. See [Validation and Accuracy](Validation-and-Accuracy)
-for the results. Every rule below was either confirmed that way, or found through a mismatch
-that it then fixed.
+so the two can be compared trade by trade. Every rule below was found that way: replay until
+the first trade that differs from the exchange's, work out why, fix the rule, repeat. The
+engine now reproduces the exchange's trade records essentially exactly; see
+[Validation and Accuracy](Validation-and-Accuracy).
 
 If you are new to order books, read the first two sections. If you already know price-time
 priority, skip to [section 4](#4-entering-an-order-trade-now-rest-or-discard).
@@ -55,7 +56,9 @@ For each security, the engine holds:
 | State | What it is |
 |---|---|
 | **Price levels** | Two sorted maps (bids and asks) from price to a level. Each level stores its total visible and hidden quantity, and a first-in-first-out **queue** of order numbers. |
-| **Resting orders** | For each order on the book: side, price, **visible** quantity, **hidden** quantity, **tranche** size (for icebergs), **remaining** total, and the participant flags (`algo_indicator`, `client_identity`). |
+| **Resting orders** | For each order on the book: side, price, **visible** quantity, **hidden** quantity, **tranche** size and what is left of the current tranche (for icebergs), **remaining** total, and the participant flags (`algo_indicator`, `client_identity`). |
+| **Pre-open orders** | Orders collected before the call auction, with their time priority (section 11). |
+| **Closing price** | The 15:00–15:30 average of the engine's own trades, for the post-close session (section 11). |
 | **Waiting stop-loss orders** | Stop orders that have not triggered yet. They are held *off* the book. |
 | **Discarded remainders** | IOC and market orders whose unfilled part was thrown away, so the cancel the feed writes for it later can be recognised. |
 | **Announced cancels** | Cancels read *ahead* of the current message, used for self-trade prevention (section 8). |
@@ -77,7 +80,16 @@ The orders file has one record per message, with an **activity type**:
 | `3` | **Cancel** | Remove the order from wherever it is |
 | `4` | **Modify** | Change the order: in place, or by removing and re-entering it |
 
-The top-level flow for one message:
+Which rules apply depends on the time of day:
+
+| Time | Session | What happens |
+|---|---|---|
+| 09:00 – about 09:08 | **Pre-open call auction** | Orders are collected, not matched; then all matched at one price (section 11) |
+| 09:08 – 09:15 | Buffer | Unfilled market orders from the auction become limit orders; nothing trades |
+| 09:15 – 15:30 | **Continuous trading** | Everything in sections 4 to 10 |
+| from 15:40 | **Post-close session** | Every order trades at the closing price, in time order (section 11) |
+
+In the continuous session, the top-level flow for one message:
 
 ```mermaid
 flowchart TD
@@ -170,10 +182,9 @@ the remainder is discarded at once.
 | New order rests | Back of the queue at its price |
 | Partially filled, still showing quantity | **Keeps** its position at the front |
 | Iceberg reveals its next tranche | **Back** of the queue (section 9) |
-| Modify: quantity reduced, same price and disclosed quantity | **Keeps** its position |
+| Modify at the same price that does **not** increase what the order shows | **Keeps** its position |
+| Modify at the same price that increases what the order shows | **Back** |
 | Modify: price changed | **Back**, at the new price |
-| Modify: quantity increased | **Back** |
-| Modify: disclosed quantity changed | **Back** |
 | Stop-loss triggers | Back of the queue, timed from the trigger |
 
 ---
@@ -192,13 +203,14 @@ flowchart TD
     CR -->|yes| FR{Front of the queue at P}
     FR -->|queue empty| DL[Delete level P] --> BL
     FR -->|tombstone or stale entry| POP[Pop it] --> FR
-    FR -->|live order O| STP{Exchange cancelled O<br/>at this step of the sweep?<br/>section 8}
-    STP -->|yes| WD[Withdraw O without trading.<br/>Sweep step + 1] --> FR
+    FR -->|live order O| STP{A cancel in this<br/>step's slot?<br/>section 8}
+    STP -->|cancel of O| WD[Withdraw O without trading.<br/>Step + 1; the next trade<br/>is a new record] --> FR
+    STP -->|cancel of the incoming order| STOPIN([Stop: the incoming order<br/>is cancelled, nothing rests])
     STP -->|no| VIS{O shows any<br/>visible quantity?}
     VIS -->|no, iceberg with hidden left| REV[Reveal next tranche,<br/>move O to BACK] --> FR
     VIS -->|yes| TR["Trade min(Q, visible) at P,<br/>the resting price"]
-    TR --> MG{Same pair and price<br/>as the previous fill?}
-    MG -->|yes| ADD[Add to that trade]
+    TR --> MG{Same pair and price as the<br/>previous fill, nothing<br/>printed in between?}
+    MG -->|yes| ADD[Add to that trade.<br/>O then shows a fresh<br/>full tranche: section 9]
     MG -->|no| NEW[New trade record.<br/>Sweep step + 1]
     ADD --> AFT{O's state now}
     NEW --> AFT
@@ -227,8 +239,12 @@ The exchange writes **one trade record per (incoming, resting) pair per price** 
 Say an incoming order eats through an iceberg that is alone at its price. Each revealed
 tranche goes to the back of a queue that has nothing else in it, so it is immediately at the
 front again. The exchange prints the whole execution as **one** trade. The engine merges
-consecutive fills of the same pair at the same price in the same way. If anything else traded
-in between, the fills are separate trades.
+consecutive fills of the same pair at the same price in the same way.
+
+The record ends when anything else is printed in between: a trade with another order, or a
+self-trade-prevention cancel (section 8), which is a message of its own. After that, a further
+fill between the same two orders is a new record. That matters beyond counting records: it
+decides how much of the iceberg shows afterwards (section 9).
 
 ---
 
@@ -236,7 +252,7 @@ in between, the fills are separate trades.
 
 A modify record (activity type 4) carries the order's **new state**. It includes the new
 price and the **remaining** quantity, not the original total: fills since entry have already
-been subtracted. The engine decides between two treatments:
+been subtracted.
 
 ```mermaid
 flowchart TD
@@ -244,23 +260,46 @@ flowchart TD
     SLN -->|yes| RE[Take N off the book if it is live<br/>and hold it as a WAITING stop]
     SLN -->|no| W{N is a waiting<br/>stop-loss?}
     W -->|yes| CONV[Convert: enter as an<br/>ordinary live order]
-    W -->|no| AM{On the book, same side and price,<br/>new quantity not above remaining,<br/>same disclosed quantity?}
-    AM -->|yes| INP([Amend in place:<br/>reduce quantity,<br/>KEEP queue position])
+    W -->|no| AM{On the book at the same price,<br/>and what it shows does<br/>not increase?}
+    AM -->|yes| INP([Amend in place:<br/>KEEP queue position])
     AM -->|no| LIVE{On the book?}
     LIVE -->|yes| CTE([Cancel-then-enter:<br/>remove, re-enter as a new order,<br/>BACK of the queue.<br/>It can trade immediately])
     LIVE -->|no| UNK([Not known: enter it anyway<br/>and count an unknown reference])
 ```
 
-* **Reduce-only amend keeps priority.** Lowering the quantity at the same price is harmless
-  to other traders, and NSE keeps the order's place. The trade file confirms this: treating
-  these as cancel-then-enter moved orders behind others they had in fact traded ahead of.
-* **Everything else is cancel-then-enter.** A price change, a quantity increase, or a change
-  to the disclosed quantity removes the order and re-enters it as if it were new. A re-entered
-  order **goes through the full entry path**. If its new price crosses the spread, it trades
-  immediately, exactly like a new order.
-* **A modify of an unknown order** happens legitimately in one case. When a market order's
-  remainder has been discarded, the exchange can convert that remainder to a limit order by
-  modifying it. The engine enters it, and does not count the conversion as an error.
+**Queue position.** At the same price, an order keeps its place **unless the quantity it
+displays grows**. Other traders only see the displayed quantity, so a change that doesn't
+show more doesn't jump anyone. So:
+
+* reducing an ordinary order: keeps its place;
+* raising an ordinary order: back of the queue;
+* an iceberg cutting its disclosed quantity (showing less): keeps its place;
+* an iceberg raising its disclosed quantity so that it shows more: back of the queue;
+* an iceberg raising its *total* but keeping its disclosed quantity: keeps its place, since
+  what it shows is unchanged;
+* any price change: back of the queue, at the new price.
+
+**What an iceberg shows after a modify.** The exchange keeps counting down the current
+tranche through a modify, as long as the disclosed quantity stays the same. Change the
+disclosed quantity and it starts a fresh tranche, with two refinements, both measured:
+
+| Modify | Shows afterwards |
+|---|---|
+| Same disclosed quantity | What was left of the current tranche |
+| Disclosed quantity cut to exactly the quantity remaining before the modify | What was left of the current tranche |
+| Either of those, but raising the quantity of an order that was showing all it had left (for an unchanged disclosed quantity: an order down to less than one tranche) | A fresh full tranche |
+| Any other change of disclosed quantity | A fresh full tranche of the new size |
+
+These tables are what made the difference between about 99% and 100% agreement on orders
+that modify often (algorithmic icebergs re-price many times a second).
+
+**A re-entered order goes through the full entry path.** If its new price crosses the spread,
+it trades immediately, exactly like a new order, and those trades count against its tranche
+(section 9).
+
+**A modify of an unknown order** happens legitimately in one case: the exchange converts an
+unfilled market order to a limit order with a modify (after the pre-open auction, for
+instance). The engine enters it and does not count the conversion as an error.
 
 ---
 
@@ -302,8 +341,10 @@ trade immediately if its limit is marketable.
 ## 8. Self-trade prevention (STP)
 
 Exchanges do not let a client trade with itself. At NSE, when an incoming order would match a
-resting order belonging to the **same client**, the exchange **cancels the resting order**
-instead, and the incoming order carries on to the next order in the queue.
+resting order belonging to the **same client**, the exchange cancels one of the two instead.
+Usually it is the **resting** order, and the incoming order carries on to the next order in
+the queue. Sometimes it is the **incoming** order, which then stops: it trades no further and
+nothing of it rests.
 
 The difficulty is that the orders file **has no client identifier**. All the replay can see
 is the result: a cancel of the resting order, written by the exchange *during* the incoming
@@ -348,21 +389,27 @@ sequenceDiagram
    covers sweeps of several thousand steps.
 2. **Count the sweep.** While matching an incoming order, the engine counts the steps: each
    new trade record and each STP withdrawal is one step.
-3. **Check each resting order before trading it.** A resting order is withdrawn, not traded,
-   when:
-   * a cancel for it has been announced at time *t* with
-     `|(t − t0) − (step + 1) × jiffy| ≤ 2 jiffies + 2 µs` (timestamps are truncated to whole
-     microseconds), **and**
-   * it could be the same client: it has the same `algo_indicator` and `client_identity`
-     category as the incoming order. These are the only parts of a client's identity the file
-     records.
-4. When the resting order's own cancel is later applied, the engine recognises it as already
+3. **Check each resting order before trading it.** Look for a cancel in this step's slot,
+   `(step + 1) × jiffy` after the incoming order, to within half a jiffy (timestamps are
+   truncated to whole microseconds):
+   * a cancel of the **resting order** there: withdraw it without trading, and carry on;
+   * a cancel of the **incoming order** there: stop. Nothing more trades and nothing rests.
+
+   The file has no client identifier, and neither the algo flag nor the participant category
+   (`client_identity`) will do as one: the exchange prevents trades between a client's
+   algorithmic and manual orders, and between its custodian and non-custodian orders, and
+   filtering on either hid genuine preventions. The cancel's slot is the evidence. Coming back
+   to the order the incoming order is already trading with (its next tranche) is a
+   continuation, never STP.
+4. When the withdrawn order's own cancel is later applied, the engine recognises it as already
    handled.
 
 Why so exact? Traders often cancel their own orders soon after a partial fill, a few hundred
 microseconds later. A loose "cancelled within 1 ms" rule withdrew those as well, before they
 had in fact traded. It also missed genuine STP cancels deep inside large sweeps, stamped 2–4
-ms after the entry. Slot timing tells the two apart.
+ms after the entry. And an IOC's ordinary remainder cancel lands exactly one slot after its
+last trade, which a tolerance of more than half a jiffy mistakes for STP. Slot timing, to half
+a jiffy, tells them all apart.
 
 Callers that never announce events get the plain textbook behaviour: every resting order can
 be matched. The replay in `nsetick book` and `replay_fills` always announces.
@@ -375,26 +422,45 @@ An order with `0 < volume_disclosed < volume_original` is an **iceberg**. It sho
 `volume_disclosed` (one **tranche**) at a time. The rest is real liquidity that nobody else
 can see.
 
+**How much shows.** The exchange counts down what is left of the current tranche. Every
+**trade record** the order takes part in counts against it, whether the order is resting or
+is the one arriving:
+
+* a trade that takes **the whole tranche or more** leaves a **fresh full tranche** showing
+  (or the whole remainder, if that is less);
+* a **smaller** trade just reduces what shows.
+
 ```mermaid
 stateDiagram-v2
-    [*] --> Showing: Rests, visible = min(tranche, remaining), hidden = the rest
-    Showing --> Showing: Partial fill of the visible tranche (keeps queue position)
-    Showing --> Revealed: Visible tranche used up, hidden > 0
-    Revealed --> Showing: Next tranche = min(tranche, remaining) becomes visible, order moves to the BACK of the queue
-    Showing --> Done: Remaining reaches 0
-    Showing --> Done: Cancelled
+    [*] --> Showing: Enters with one full tranche (its own trades on entry count against it)
+    Showing --> Showing: A trade smaller than what shows (keeps queue position)
+    Showing --> Refilled: A trade uses up what shows
+    Refilled --> Showing: A fresh full tranche shows and the order moves to the BACK of the queue
+    Showing --> Showing: A trade runs on into the next tranche (alone at its price): a fresh full tranche shows
+    Showing --> Done: Remaining reaches 0, or cancelled
     Done --> [*]
 ```
 
-* **Replenishment loses priority.** Every newly revealed tranche joins the **back** of the
-  queue at its price, behind orders that arrived after the iceberg did. The trade file
-  confirms this: keeping the iceberg at the front dropped exact trade matches from about 95% to
-  about 65%.
-* **A partly filled iceberg that rests** (it traded some on entry) shows one full tranche, or
-  whatever is left if that is less.
-* **Snapshots report both parts.** `bid_qty_k` / `ask_qty_k` are what other participants saw.
-  `bid_hidden_k` / `ask_hidden_k` are what was really there.
-* **A modify that changes `volume_disclosed`** is cancel-then-enter with the new tranche size.
+Three consequences that are easy to get wrong, each of which cost measurable accuracy until it
+was found:
+
+* **A trade that runs on into the next tranche leaves a full tranche, not the leftover.** An
+  iceberg showing 10 that is hit for 15 in one trade (possible when it is alone at its price)
+  then shows 10, not 5.
+* **Its own trades count.** An iceberg that enters showing 10 and trades 3 on arrival rests
+  showing 7, not 10.
+* **Only records count, not fills.** If a self-trade-prevention cancel splits one incoming
+  order's trades with the iceberg into two records, the second record is an ordinary small
+  trade (section 5).
+
+**Replenishment loses priority.** Every fresh tranche joins the **back** of the queue at its
+price, behind orders that arrived after the iceberg did. (Keeping it at the front instead
+drops exact trade matches from about 95% to about 65%.)
+
+**Snapshots report both parts.** `bid_qty_k` / `ask_qty_k` are what other participants saw.
+`bid_hidden_k` / `ask_hidden_k` are what was really there.
+
+**Modifies** can keep the current tranche's count or start a fresh one; see section 6.
 
 ---
 
@@ -405,7 +471,7 @@ The book starts with three sell orders at 100.00 and one at 100.50 (quantities i
 | Queue at 100.00 | Order | Visible | Hidden | Notes |
 |---|---|---|---|---|
 | 1st | #1 | 100 | 400 | iceberg, tranche 100 |
-| 2nd | #2 | 50 | 0 | same participant category as the buyer; the file has its cancel at t0+2j |
+| 2nd | #2 | 50 | 0 | the buyer's own order; the file has its cancel at t0+2j |
 | 3rd | #3 | 200 | 0 | |
 | at 100.50 | #4 | 300 | 0 | |
 
@@ -419,8 +485,9 @@ A **buy limit 100.50 for 500** (#9) arrives at t0:
 | 3 | t0+4j | Trade #9 × #1 (its second tranche): 100 @ 100.00. Reveal again, #1 to the back (it is now alone) | 100 |
 | (merged) | | #1 is at the front again. Trade #9 × #1: 100 more @ 100.00, **merged into step 3's trade** (same pair and price, nothing in between) | 0 |
 
-The trade file shows four trades: #9×#1 100, #9×#3 200, #9×#1 200, all at 100.00, and no
-trade with #2. The ask at 100.50 is untouched, because the order was filled before it got
+The trade file shows three trades: #9×#1 100, #9×#3 200, #9×#1 200, all at 100.00, and no
+trade with #2. Afterwards #1 has 200 left and shows a fresh tranche of 100: the last trade ran
+on into a new tranche. The ask at 100.50 is untouched, because the order was filled before it got
 there. (j is one jiffy; #2's cancel counts as STP because it sits in the slot of step 1,
 the step at which the sweep reached #2.)
 
@@ -430,31 +497,60 @@ have been discarded, not rested at 100.50.
 
 ---
 
-## 11. What the engine does not model
+## 11. The pre-open auction and the post-close session
 
-* **The pre-open call auction** (09:00–09:08). NSE collects orders and matches them at one
-  price. The engine matches them continuously as they arrive, so the book before 09:15 is
-  approximate. Use snapshots and trades from **09:15** onward. The comparison with the trade
-  file uses the continuous session only.
+### Pre-open call auction
+
+From 09:00 NSE collects orders without matching them. Order entry closes at a random moment
+between 09:07 and 09:08, and all orders are then matched at **one price**. The engine
+reproduces the exchange's auction trades exactly, trade for trade, in all 240 security-sessions
+examined (90,736 trades):
+
+1. **The equilibrium price** is the limit price at which the most quantity can trade. If
+   several prices tie, the one leaving the smallest imbalance between buying and selling. If
+   they still tie, the one closest to the **previous day's close** (checked on every tied
+   session whose previous day is in the data).
+2. **Who trades:** buys at or above that price, sells at or below it, and every market order.
+3. **In what order:** buys best price first, sells best price first; **market orders after
+   every limit order** (in effect at the equilibrium price, behind the limit orders there);
+   within a price, earlier first. The two lists are paired off in order, each trade the
+   smaller of the two remainders.
+4. **Time priority through a pre-open modify** follows the same idea as in section 6: an order
+   keeps its time if the modify leaves its price unchanged and does not raise its quantity.
+5. **What is left** joins the continuous book at its limit in that priority order. An
+   unfilled market order does not: moments later the feed shows the exchange converting it to
+   a limit order at the equilibrium price, and that modify enters it.
+
+The engine knows the auction has happened from the time (09:08) or from that first conversion
+modify. A trader can also turn a market order into a limit order before the close, so a
+conversion is recognised only if the auction, run as things stand, prices exactly at the
+modify's limit and leaves exactly the modify's quantity unfilled.
+
+The previous close is not in a day's files, but the feed usually settles a tie anyway: the
+conversions of unfilled market orders carry the exchange's equilibrium price, and the engine
+takes the price from the first one. That settled every tie in the 240 security-sessions
+checked. When there is nothing to convert, pass the previous close with `previous_close=`
+(Python) or `--previous-close` (CLI); without it the lowest candidate price is taken, which
+changes only the auction's price.
+
+### Post-close session
+
+After continuous trading ends at 15:30, orders are cancelled and, from 15:40, orders are taken
+at the **closing price** only. Every order, market orders included, joins one queue at that
+price and trades in time order. The closing price is the volume-weighted average of trades from
+15:00 to 15:30, **truncated to whole paise, then rounded to the nearest tick** (5 paise): exact
+in all 240 security-sessions checked. The engine computes it from its own trades.
+
+## 12. What the engine does not model
+
 * **Price bands, circuit breakers, trading halts, freeze-quantity rejections.** Orders the
   exchange rejected never appear in the orders file, so no model of these is needed.
-* **Where an iceberg's next tranche trades.** When an incoming order uses up an iceberg's
-  visible tranche and still wants more at that price, the engine puts the new tranche at the
-  back of the queue. If the iceberg is **alone** at its price, that means it is immediately at
-  the front again, and the incoming order carries on into it. If **other orders** are queued,
-  the incoming order moves on to them first. Measured at every such moment (TCS, INFY and
-  RELIANCE, 25 Jan 2022, about 750,000 cases), the pair ends up trading exactly the
-  exchange's quantity in **97.6%** of cases when the iceberg is alone, but only **87–91%**
-  when other orders are queued. In those misses the exchange took more from the iceberg about as
-  often as it took less. The queued order's age, whether it was just modified, whether it is
-  itself an iceberg, and whether it is older than the iceberg were all checked; none separates
-  the two outcomes. This is the largest single cause of the remaining difference from the trade
-  file, and it changes who traded with whom far more often than how much each order traded.
-* **Client identity.** STP is inferred from timing and participant category. On rare
-  occasions, a coincidental cancel in exactly the right slot from a different client of the
-  same category would be treated as STP.
+* **Client identity.** STP is inferred from the cancel's timing alone. A trader's own cancel
+  landing by coincidence in exactly the right half-jiffy slot would be taken for STP. No such
+  case turned up in the data checked.
+* **The previous close** (above).
 
-## 12. Counters
+## 13. Counters
 
 `OrderBook::stats()` (and the snapshot `interval_*` columns) expose what the engine did. They
 are useful for checking a replay:
@@ -472,9 +568,9 @@ are useful for checking a replay:
 | `amended_in_place` | Modifies that kept queue priority |
 | `stops_held` | Stop-loss orders put into the waiting state |
 | `stops_triggered` | Stops that entered the book, by trigger record or conversion |
-| `self_trade_preventions` | Resting orders withdrawn by STP |
+| `self_trade_preventions` | Orders withdrawn by STP, resting or incoming |
 
-## 13. Check it yourself
+## 14. Check it yourself
 
 ```python
 import nsetick

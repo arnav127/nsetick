@@ -340,7 +340,7 @@ impl BatchReader {
 #[pyfunction]
 #[pyo3(signature = (
     input, out, *, date=None, where_=None, interval_secs=1.0, levels=20, threads=None,
-    compression="snappy", max_records=None, symbols=None,
+    compression="snappy", max_records=None, symbols=None, previous_close=None,
 ))]
 #[allow(clippy::too_many_arguments)]
 fn build_books(
@@ -355,7 +355,9 @@ fn build_books(
     compression: &str,
     max_records: Option<u64>,
     symbols: Option<Vec<String>>,
+    previous_close: Option<std::collections::HashMap<String, i64>>,
 ) -> PyResult<Py<PyDict>> {
+    let previous_close = previous_close.unwrap_or_default();
     let compression = match compression.to_ascii_lowercase().as_str() {
         "zstd" => parquet_zstd(),
         "snappy" => parquet::basic::Compression::SNAPPY,
@@ -393,6 +395,7 @@ fn build_books(
         req.levels = levels;
         req.threads = threads;
         req.symbols = symbols.unwrap_or_default();
+        req.previous_close = previous_close.clone();
         req.writer = WriterOptions {
             compression,
             ..WriterOptions::default()
@@ -413,6 +416,7 @@ fn build_books(
     req.levels = levels;
     req.threads = threads;
     req.max_records = max_records;
+    req.previous_close = previous_close;
     req.writer = WriterOptions {
         compression,
         ..WriterOptions::default()
@@ -560,15 +564,17 @@ fn version() -> &'static str {
 
 /// Every trade the order book replay generates, for comparison with the trade file.
 #[pyfunction]
-#[pyo3(signature = (input, symbols=None))]
+#[pyo3(signature = (input, symbols=None, previous_close=None))]
 fn replay_fills(
     py: Python<'_>,
     input: PathBuf,
     symbols: Option<Vec<String>>,
+    previous_close: Option<std::collections::HashMap<String, i64>>,
 ) -> PyResult<PyArrowType<RecordBatch>> {
     let symbols = symbols.unwrap_or_default();
+    let previous_close = previous_close.unwrap_or_default();
     let batch = py
-        .detach(|| nsetick_book::fills::replay_fills(&input, &symbols))
+        .detach(|| nsetick_book::fills::replay_fills(&input, &symbols, &previous_close))
         .map_err(to_py_err)?;
     Ok(PyArrowType(batch))
 }

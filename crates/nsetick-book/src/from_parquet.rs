@@ -44,6 +44,9 @@ pub struct ParquetReplayRequest {
     /// Restrict to these symbols. Empty means every symbol present.
     pub symbols: Vec<String>,
     pub writer: WriterOptions,
+    /// Previous session's closing price per symbol, in paise. Only used to break a tie between
+    /// equally good pre-open auction prices; see [`crate::book::OrderBook::set_previous_close`].
+    pub previous_close: std::collections::HashMap<String, i64>,
     /// Polled between files so a long replay can be interrupted. See `ParseRequest`.
     #[allow(clippy::type_complexity)]
     pub interrupt: Option<std::sync::Arc<dyn Fn() -> Result<()> + Send + Sync>>,
@@ -64,6 +67,7 @@ impl ParquetReplayRequest {
             threads: None,
             symbols: Vec::new(),
             writer: WriterOptions::default(),
+            previous_close: Default::default(),
             interrupt: None,
         }
     }
@@ -163,6 +167,7 @@ fn replay_file(
     interval_micros: i64,
     levels: usize,
     writer: &Mutex<PartitionedWriter>,
+    previous_close: &std::collections::HashMap<String, i64>,
 ) -> Result<(u64, u64, u64, u64, usize, usize)> {
     let batches = read_projected(path)?;
     let mut builder = SnapshotBuilder::new(levels);
@@ -175,9 +180,10 @@ fn replay_file(
 
     for batch in &batches {
         for (sym, evs) in events_by_symbol(batch)? {
-            let replay = books
-                .entry(sym.clone())
-                .or_insert_with(|| SymbolReplay::new(sym.clone()));
+            let replay = books.entry(sym.clone()).or_insert_with(|| {
+                SymbolReplay::new(sym.clone())
+                    .with_previous_close(previous_close.get(&sym).copied())
+            });
             for ev in &evs {
                 progress += replay.feed(ev, &mut builder, interval_micros);
             }
@@ -270,7 +276,13 @@ pub fn run(req: &ParquetReplayRequest) -> Result<ReplayReport> {
                         break;
                     }
                 }
-                match replay_file(&files[i], interval_micros, req.levels, &writer) {
+                match replay_file(
+                    &files[i],
+                    interval_micros,
+                    req.levels,
+                    &writer,
+                    &req.previous_close,
+                ) {
                     Ok((e, f, s, r, syms, cr)) => {
                         let mut t = totals.lock().expect("totals lock");
                         t.0 += e;

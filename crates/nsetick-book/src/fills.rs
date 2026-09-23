@@ -43,7 +43,14 @@ pub fn schema() -> Arc<Schema> {
 /// or a single parquet file; `symbols` restricts it, empty meaning all. `txn_time` is the
 /// time of the incoming order's event; the exchange stamps its own trade records one feed
 /// tick (about 15 microseconds) per trade later, so join on order numbers, not on time.
-pub fn replay_fills(input: &Path, symbols: &[String]) -> Result<RecordBatch> {
+///
+/// `previous_close` gives each symbol's previous closing price in paise, used only to break a
+/// tie between equally good pre-open auction prices; symbols without one take the lowest.
+pub fn replay_fills(
+    input: &Path,
+    symbols: &[String],
+    previous_close: &std::collections::HashMap<String, i64>,
+) -> Result<RecordBatch> {
     // Snapshots are not wanted here: an interval longer than any session means none is taken.
     let never = i64::MAX / 4;
     let mut builder = SnapshotBuilder::new(1);
@@ -60,9 +67,11 @@ pub fn replay_fills(input: &Path, symbols: &[String]) -> Result<RecordBatch> {
         let mut replays: std::collections::HashMap<String, SymbolReplay> = Default::default();
         for batch in read_projected(&file)? {
             for (s, events) in events_by_symbol(&batch)? {
-                let r = replays
-                    .entry(s.clone())
-                    .or_insert_with(|| SymbolReplay::new(s.clone()).record_fills());
+                let r = replays.entry(s.clone()).or_insert_with(|| {
+                    SymbolReplay::new(s.clone())
+                        .with_previous_close(previous_close.get(&s).copied())
+                        .record_fills()
+                });
                 for ev in &events {
                     r.feed(ev, &mut builder, never);
                 }

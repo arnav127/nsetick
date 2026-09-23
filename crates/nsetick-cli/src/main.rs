@@ -215,6 +215,40 @@ struct BookArgs {
     /// Stop after roughly this many records. For smoke tests.
     #[arg(long)]
     max_records: Option<u64>,
+
+    /// CSV of `symbol,price` (paise) giving each symbol's previous closing price. Only used to
+    /// break a tie between equally good pre-open auction prices.
+    #[arg(long)]
+    previous_close: Option<PathBuf>,
+}
+
+/// Read `symbol,price` lines; a header line or blank lines are skipped.
+fn read_previous_close(path: &Path) -> Result<std::collections::HashMap<String, i64>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = std::collections::HashMap::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Some((sym, price)) = line.split_once(',') else {
+            bail!("{}:{}: expected symbol,price", path.display(), n + 1);
+        };
+        match price.trim().parse::<i64>() {
+            Ok(p) => {
+                out.insert(sym.trim().to_string(), p);
+            }
+            Err(_) if n == 0 => continue,
+            Err(_) => bail!(
+                "{}:{}: price must be whole paise, got {:?}",
+                path.display(),
+                n + 1,
+                price.trim()
+            ),
+        }
+    }
+    Ok(out)
 }
 
 /// Pull DDMMYYYY or YYYY-MM-DD out of a `date=...` directory name.
@@ -252,6 +286,9 @@ fn cmd_book(args: BookArgs) -> Result<()> {
         req.levels = args.levels;
         req.threads = args.threads;
         req.symbols = args.symbols.clone().unwrap_or_default();
+        if let Some(p) = &args.previous_close {
+            req.previous_close = read_previous_close(p)?;
+        }
         req.writer = WriterOptions {
             compression,
             ..WriterOptions::default()
@@ -277,6 +314,9 @@ fn cmd_book(args: BookArgs) -> Result<()> {
     req.levels = args.levels;
     req.threads = args.threads;
     req.max_records = args.max_records;
+    if let Some(p) = &args.previous_close {
+        req.previous_close = read_previous_close(p)?;
+    }
     req.writer = WriterOptions {
         compression,
         ..WriterOptions::default()

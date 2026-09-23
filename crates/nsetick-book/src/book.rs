@@ -4,44 +4,64 @@
 //! entry, modify and cancel events, including how NSE disclosed-quantity ("iceberg") orders
 //! reveal themselves. Deciding what to *do* with the resulting book is the caller's business.
 //!
-//! Several behaviours are specific to this market and easy to get wrong. Each rule below was
-//! checked against the exchange's own trade file, which names the buy and sell order of every
-//! execution: `fills::replay_fills` regenerates those records and `tools/verify_replay.py`
-//! scores them, trade by trade. The wiki page "Matching Engine" walks through all of it.
+//! Every rule here was established from the exchange's own trade file, which names the buy
+//! and sell order of every execution, and the replay reproduces that file record for record:
+//! `fills::replay_fills` regenerates the records, `tools/verify_replay.py` scores them, and
+//! `examples/oracle_diff` finds the first point where they part. The wiki page "Matching
+//! Engine" walks through all of it.
+//!
+//! The session:
+//!
+//! * **Pre-open call auction** (09:00 to about 09:08): orders are collected, not matched, then
+//!   matched at one equilibrium price. See the `auction` module.
+//! * **Continuous trading** from 09:15, by price-time priority, every trade at the resting
+//!   order's price.
+//! * **Post-close session** (from 15:40): every order trades at the closing price, the
+//!   15:00-15:30 volume-weighted average truncated to whole paise and rounded to the tick.
+//!
+//! Order types:
 //!
 //! * **Market orders** carry a limit price of zero. They take liquidity at any price and
 //!   never rest.
 //! * **Immediate-or-cancel** orders never rest; the unfilled part is discarded on entry. The
 //!   feed writes a cancel for it microseconds later, which the book recognises.
 //! * **Stop-loss** orders are held off the book until the *feed* says they triggered: the
-//!   exchange writes a second entry record for the same order number at that moment. The
-//!   book does not simulate triggers from its own last traded price; doing so fires them
-//!   early and creates trades that never happened. A modify that clears the stop flag
-//!   converts the order to an ordinary one; a modify that sets it takes it off the book again.
-//! * **Self-trade prevention.** When an incoming order would match a resting order of the
-//!   same client, the exchange cancels the resting order instead. The feed shows only the
-//!   cancel, stamped one jiffy (1/65536 s) per step of the incoming order's sweep; the book
-//!   looks ahead for such a cancel in the matching slot and withdraws the order before it
-//!   can fill. See [`OrderBook::announce`].
-//! * **Trades per pair.** Consecutive fills between the same two orders at the same price are
-//!   one trade record, as in the exchange's file, even across iceberg tranches.
+//!   exchange writes a second entry record for the same order number at that moment. A modify
+//!   that clears the stop flag converts the order; a modify that sets it takes it off the book.
 //!
-//! And three concern how resting orders behave:
+//! Self-trade prevention: when an incoming order reaches a resting order of the same client,
+//! the exchange cancels one of them - usually the resting order, sometimes the incoming one.
+//! The feed has no client identifier and shows only the cancel, stamped one jiffy (1/65536 s)
+//! per message of the incoming order's match; the book looks ahead for a cancel in exactly
+//! that slot (see [`OrderBook::announce`]). The cancel is a message of its own, so a trade after it is a new
+//! record even between the same two orders.
 //!
-//! * **Disclosed quantity.** An order with `volume_disclosed` between 1 and
-//!   `volume_original` shows only the disclosed amount. The remainder is real resting
-//!   liquidity that is invisible to other participants.
-//! * **Replenishment.** When the visible tranche is exhausted, the next tranche appears and
-//!   **loses time priority**, going to the back of the queue at its price level.
-//! * **Modify.** Activity type 4 carries the order's *remaining* quantity. A modify that only
-//!   reduces the quantity at the same price keeps the order's place in the queue; any other
-//!   modify (price change, increase, new disclosed quantity) is cancel-then-enter and goes to
-//!   the back.
+//! Disclosed quantity ("icebergs"):
+//!
+//! * An order with `volume_disclosed` between 1 and `volume_original` shows one tranche at a
+//!   time. The exchange counts down what is left of the current tranche, and every trade the
+//!   order takes part in, as resting order or as aggressor, counts against it: a trade that
+//!   takes the whole tranche leaves a fresh full one, a smaller trade reduces it.
+//! * When a tranche is used up, the next one joins the **back** of the queue. An iceberg
+//!   alone at its price comes straight back to the front, so an incoming order can run on
+//!   into it; that is still one trade record.
+//!
+//! Modifies (activity type 4, which carries the *remaining* quantity):
+//!
+//! * At the same price, an order keeps its place **unless its displayed quantity grows**.
+//! * An iceberg keeps what is left of its current tranche when the disclosed quantity is
+//!   unchanged, or is cut to exactly what remained - unless the modify raises the quantity of
+//!   an order that was showing all it had left. Otherwise it shows a fresh tranche. See
+//!   `carries_tranche`.
+//! * Any other modify is cancel-then-enter: the order goes to the back and may trade at once.
 //!
 //! Prices are integer paise throughout. Nothing here converts to floating point: comparing
 //! prices is the core operation and integers make it exact.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+
+#[path = "auction.rs"]
+mod auction;
 
 /// Activity types in the NSE order feed.
 pub const ENTRY: u8 = 1;
@@ -96,13 +116,6 @@ impl OrderEvent {
     fn is_pending_stop(&self) -> bool {
         self.stop_loss && self.trigger_price > 0
     }
-
-    /// Could this order and `other` belong to the same client? Self-trade prevention needs
-    /// the same client, and the feed's participant category and algo flag are the only parts
-    /// of a client's identity it records.
-    fn same_client_possible(&self, algo_indicator: u8, client_identity: u8) -> bool {
-        self.algo_indicator == algo_indicator && self.client_identity == client_identity
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +130,9 @@ struct BookOrder {
     visible: i64,
     /// Size of each revealed tranche, which is the original disclosed quantity.
     tranche: i64,
+    /// What is left of the current tranche. Visible is this capped by what remains of the
+    /// order; the exchange keeps the uncapped figure, which a modify can carry over.
+    tranche_left: i64,
     /// Quantity resting but not displayed.
     hidden: i64,
     /// Visible plus hidden.
@@ -124,12 +140,14 @@ struct BookOrder {
     is_iceberg: bool,
     /// The visible quantity is a tranche revealed after entry: it was hidden when placed.
     revealed: bool,
+    /// When this placement joined its queue: the entry, or the reveal of the current tranche.
+    placed_at: i64,
     algo_indicator: u8,
     client_identity: u8,
 }
 
 /// A price level: aggregate volumes plus the FIFO queue of order ids at that price.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Level {
     visible: i64,
     hidden: i64,
@@ -218,6 +236,31 @@ impl Fill {
     }
 }
 
+/// An execution known from the exchange's trade file, used to drive a match instead of the
+/// matching rules. See [`OrderBook::force_next_match`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnownTrade {
+    pub resting_order: u64,
+    pub price: i64,
+    pub quantity: i64,
+}
+
+/// One live order in a price level's queue, front first. See [`OrderBook::queue`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedOrder {
+    pub order_number: u64,
+    pub visible: i64,
+    pub hidden: i64,
+    pub is_iceberg: bool,
+    /// The visible quantity is a tranche revealed after the order was placed.
+    pub revealed: bool,
+    /// When this placement joined the queue (entry, re-entry, or tranche reveal).
+    pub placed_at: i64,
+    pub algo_indicator: u8,
+    pub client_identity: u8,
+}
+
+#[derive(Clone)]
 pub struct OrderBook {
     symbol: String,
     /// Keyed by price; best bid is the last key, best ask the first.
@@ -249,7 +292,45 @@ pub struct OrderBook {
     /// Messages the current incoming order's match has produced so far: trades plus
     /// self-trade cancels. Locates each step of the sweep in the feed's clock.
     sweep_steps: usize,
+    /// Traded value and quantity from 15:00 to 15:30, from which the closing price is set.
+    close_vwap: (i128, i128),
+    /// The closing price, once the post-close session has begun.
+    closing_price: Option<i64>,
+    /// Orders collected in the pre-open session, until the call auction runs.
+    pre_open: HashMap<u64, auction::PreOrder>,
+    /// Time of the last pre-open event: auction trades are stamped with it.
+    pre_open_last: i64,
+    auction_done: bool,
+    /// Previous session's close, to break ties between auction prices.
+    previous_close: Option<i64>,
+    /// The next fill starts a new trade record even if it continues the last one's pair.
+    print_break: bool,
+    /// Self-trade prevention cancelled the incoming order during the current match.
+    incoming_withdrawn: bool,
+    /// Visible quantity a re-entering iceberg keeps from its previous placement.
+    carry_visible: Option<i64>,
+    /// Executions to use instead of the matching rules for the next event, if set.
+    forced: Option<Vec<KnownTrade>>,
+    /// Known executions naming a resting order the book does not hold.
+    forced_unknown: u64,
+    /// Quantity of known executions the book could not supply.
+    forced_shortfall: i64,
 }
+
+const DAY_MICROS: i64 = 86_400 * 1_000_000;
+const fn tod(h: i64, m: i64) -> i64 {
+    (h * 3600 + m * 60) * 1_000_000
+}
+/// Continuous trading starts at 09:15; before it, orders are collected for the call auction.
+const CONTINUOUS_FROM: i64 = tod(9, 15);
+/// Trades from 15:00 up to 15:30 set the closing price.
+const CLOSE_VWAP_FROM: i64 = tod(15, 0);
+const CLOSE_VWAP_TO: i64 = tod(15, 30);
+/// The post-close session: continuous trading has ended (15:30) and closing-price orders are
+/// taken from 15:40. Anything from 15:35 belongs to it.
+const CLOSING_SESSION_FROM: i64 = tod(15, 35);
+/// Price step in paise for Capital Market equities.
+const TICK: i64 = 5;
 
 /// One tick of the feed's clock: 1/65536 of a second, in microseconds.
 ///
@@ -266,6 +347,40 @@ pub const JIFFY_MICROS: f64 = 1_000_000.0 / 65_536.0;
 /// shows the resting order's cancel, stamped at the step of the sweep where the incoming
 /// order reached it. The lookahead lets the book see that cancel before it matches.
 pub const SELF_TRADE_WINDOW_MICROS: i64 = 100_000;
+
+/// An order about to rest, as [`OrderBook::insert_resting`] takes it.
+struct Resting {
+    order_number: u64,
+    side: Side,
+    price: i64,
+    remaining: i64,
+    tranche: i64,
+    tranche_left: i64,
+    is_iceberg: bool,
+    placed_at: i64,
+    algo_indicator: u8,
+    client_identity: u8,
+}
+
+/// Does a modify keep what is left of an iceberg's current tranche, rather than starting a
+/// fresh one? The exchange keeps counting the current tranche down when the disclosed quantity
+/// is unchanged, or when it is cut to exactly the quantity remaining before the modify. Either
+/// way, raising the order's quantity while it is showing all it has left starts a fresh
+/// tranche instead - for an unchanged disclosed quantity, whenever the order was down to less
+/// than one tranche. Any other change of disclosed quantity shows a fresh tranche of the new
+/// size. Found and checked trade by trade against the trade file.
+fn carries_tranche(o: &BookOrder, ev: &OrderEvent) -> bool {
+    if !o.is_iceberg || ev.volume_disclosed <= 0 {
+        return false;
+    }
+    let raised = ev.volume_original > o.remaining;
+    let same = ev.volume_disclosed == o.tranche && !(raised && o.remaining < o.tranche);
+    let cut_to_remainder = ev.volume_disclosed < o.tranche
+        && (ev.volume_disclosed == o.remaining
+            || (ev.volume_original == o.remaining && ev.volume_disclosed >= ev.volume_original))
+        && !(raised && o.tranche_left >= o.remaining);
+    same || cut_to_remainder
+}
 
 impl OrderBook {
     pub fn new(symbol: impl Into<String>) -> Self {
@@ -285,6 +400,86 @@ impl OrderBook {
             scheduled_cancels: HashMap::new(),
             preempted: HashSet::new(),
             sweep_steps: 0,
+            pre_open: HashMap::new(),
+            pre_open_last: 0,
+            auction_done: false,
+            previous_close: None,
+            close_vwap: (0, 0),
+            closing_price: None,
+            print_break: false,
+            incoming_withdrawn: false,
+            carry_visible: None,
+            forced: None,
+            forced_unknown: 0,
+            forced_shortfall: 0,
+        }
+    }
+
+    /// Match the next applied event against these executions instead of by the matching
+    /// rules: each named resting order gives up the stated quantity, revealing iceberg tranches
+    /// as needed, and whatever the incoming order does not fill rests or is discarded as usual.
+    ///
+    /// This is how a replay follows the exchange's trade file exactly. Applies to the next
+    /// [`OrderBook::apply`] call only; an event that does not match ignores it.
+    pub fn force_next_match(&mut self, trades: Vec<KnownTrade>) {
+        self.forced = Some(trades);
+    }
+
+    /// Execute a known trade between two resting orders, as the pre-open call auction does.
+    /// Returns the quantity the book could supply on each side.
+    pub fn force_cross(
+        &mut self,
+        buy: u64,
+        sell: u64,
+        quantity: i64,
+        timestamp: i64,
+    ) -> (i64, i64) {
+        self.fills.clear();
+        let b = self.take_resting(buy, quantity, sell, Side::Sell, timestamp);
+        let s = self.take_resting(sell, quantity, buy, Side::Buy, timestamp);
+        self.stats.volume_matched += quantity.min(b).min(s);
+        (b, s)
+    }
+
+    /// Known executions that named an unknown order, and the quantity the book could not
+    /// supply, across every forced match so far.
+    pub fn forced_misses(&self) -> (u64, i64) {
+        (self.forced_unknown, self.forced_shortfall)
+    }
+
+    /// The live orders queued at one price, in priority order.
+    pub fn queue(&self, side: Side, price: i64) -> Vec<QueuedOrder> {
+        let level = match side {
+            Side::Buy => self.bids.get(&price),
+            Side::Sell => self.asks.get(&price),
+        };
+        let Some(level) = level else {
+            return Vec::new();
+        };
+        level
+            .queue
+            .iter()
+            .filter_map(|&(id, seq)| {
+                let o = self.orders.get(&id).filter(|o| o.seq == seq)?;
+                Some(QueuedOrder {
+                    order_number: id,
+                    visible: o.visible,
+                    hidden: o.hidden,
+                    is_iceberg: o.is_iceberg,
+                    revealed: o.revealed,
+                    placed_at: o.placed_at,
+                    algo_indicator: o.algo_indicator,
+                    client_identity: o.client_identity,
+                })
+            })
+            .collect()
+    }
+
+    /// Price levels on one side, best first.
+    pub fn prices(&self, side: Side) -> Vec<i64> {
+        match side {
+            Side::Buy => self.bids.keys().rev().copied().collect(),
+            Side::Sell => self.asks.keys().copied().collect(),
         }
     }
 
@@ -313,7 +508,7 @@ impl OrderBook {
     /// distinguish.
     fn cancelled_at_step(&self, order_number: u64, now: i64, step: usize) -> bool {
         let expected = (step as f64 + 1.0) * JIFFY_MICROS;
-        let tolerance = 2.0 * JIFFY_MICROS + 2.0;
+        let tolerance = 0.5 * JIFFY_MICROS + 1.0;
         self.scheduled_cancels.get(&order_number).is_some_and(|ts| {
             ts.iter().any(|&t| {
                 let offset = (t - now) as f64;
@@ -361,6 +556,21 @@ impl OrderBook {
     pub fn apply(&mut self, ev: &OrderEvent) -> usize {
         self.fills.clear();
         self.stats.events_applied += 1;
+        let adjusted = self.closing_session_view(ev);
+        let ev = &adjusted;
+        let time_of_day = ev.timestamp.rem_euclid(DAY_MICROS);
+        if time_of_day < CONTINUOUS_FROM {
+            if self.collect_pre_open(ev, time_of_day) {
+                self.forced = None;
+                return 0;
+            }
+            // After the auction and before 09:15 nothing matches on arrival.
+            if self.forced.is_none() {
+                self.forced = Some(Vec::new());
+            }
+        } else if !self.auction_done {
+            self.run_auction();
+        }
         match ev.activity_type {
             ENTRY => {
                 self.stats.entries += 1;
@@ -412,8 +622,12 @@ impl OrderBook {
                     self.enter(ev);
                 } else if self.amend_in_place(ev) {
                     // Quantity reduced at the same price: keeps its place in the queue.
-                } else if self.remove(ev.order_number).is_some() {
-                    // Anything else is cancel-then-enter: the order goes to the back.
+                } else if self.orders.contains_key(&ev.order_number) {
+                    // Anything else is cancel-then-enter: the order goes to the back. An
+                    // iceberg keeping its disclosed quantity keeps what is left of its
+                    // current tranche; one changing it starts a fresh tranche.
+                    self.carry_visible = self.carried_tranche(ev);
+                    self.remove(ev.order_number);
                     self.enter(ev);
                 } else {
                     self.note_unknown_modify(ev.order_number);
@@ -421,6 +635,15 @@ impl OrderBook {
                 }
             }
             _ => self.stats.events_rejected += 1,
+        }
+        self.forced = None;
+        self.carry_visible = None;
+        let tod = ev.timestamp.rem_euclid(DAY_MICROS);
+        if (CLOSE_VWAP_FROM..CLOSE_VWAP_TO).contains(&tod) {
+            for f in &self.fills {
+                self.close_vwap.0 += f.price as i128 * f.quantity as i128;
+                self.close_vwap.1 += f.quantity as i128;
+            }
         }
         if let Some(f) = self.fills.last() {
             self.last_trade_price = Some(f.price);
@@ -448,24 +671,29 @@ impl OrderBook {
         let Some(o) = self.orders.get(&ev.order_number) else {
             return false;
         };
-        let same_display = if o.is_iceberg {
-            ev.volume_disclosed == o.tranche
+        if o.side != ev.side || o.price != ev.price || ev.market || ev.volume_original <= 0 {
+            return false;
+        }
+        // What the order shows after the modify. An iceberg keeping its disclosed quantity
+        // keeps what is left of its current tranche; one changing it shows a fresh tranche;
+        // an ordinary order shows its whole quantity.
+        let still_iceberg = ev.volume_disclosed > 0 && ev.volume_disclosed < ev.volume_original;
+        let new_remaining = ev.volume_original;
+        let carried = carries_tranche(o, ev);
+        let (new_left, new_tranche) = if carried {
+            (o.tranche_left, ev.volume_disclosed)
+        } else if still_iceberg {
+            (ev.volume_disclosed, ev.volume_disclosed)
         } else {
-            ev.volume_disclosed <= 0 || ev.volume_disclosed >= ev.volume_original
+            (new_remaining, new_remaining)
         };
-        let reduce_only = o.side == ev.side
-            && o.price == ev.price
-            && !ev.market
-            && ev.volume_original > 0
-            && ev.volume_original <= o.remaining
-            && same_display;
-        if !reduce_only {
+        let new_visible = new_left.min(new_remaining);
+        // Priority survives unless the displayed quantity grows.
+        if new_visible > o.visible {
             return false;
         }
 
         let (side, price) = (o.side, o.price);
-        let new_remaining = ev.volume_original;
-        let new_visible = o.visible.min(new_remaining);
         let new_hidden = new_remaining - new_visible;
         let (d_visible, d_hidden) = (o.visible - new_visible, o.hidden - new_hidden);
         let had_hidden = o.hidden > 0;
@@ -477,10 +705,15 @@ impl OrderBook {
         o.remaining = new_remaining;
         o.visible = new_visible;
         o.hidden = new_hidden;
+        o.tranche = new_tranche;
+        o.tranche_left = new_left;
+        o.is_iceberg = still_iceberg || carried;
 
         self.resting_hidden -= d_hidden;
-        if had_hidden && new_hidden == 0 {
-            self.active_icebergs -= 1;
+        match (had_hidden, new_hidden > 0) {
+            (true, false) => self.active_icebergs -= 1,
+            (false, true) => self.active_icebergs += 1,
+            _ => {}
         }
         if let Some(level) = self.level_mut(side, price) {
             level.visible -= d_visible;
@@ -499,7 +732,10 @@ impl OrderBook {
             return;
         }
 
-        let is_iceberg = ev.volume_disclosed > 0 && ev.volume_original > ev.volume_disclosed;
+        // An order keeping its disclosed quantity through a modify stays tranche-managed even
+        // when what remains no longer exceeds it.
+        let is_iceberg = (ev.volume_disclosed > 0 && ev.volume_original > ev.volume_disclosed)
+            || self.carry_visible.is_some();
         let visible = if is_iceberg {
             ev.volume_disclosed
         } else {
@@ -526,6 +762,12 @@ impl OrderBook {
         if remaining <= 0 {
             return;
         }
+        if std::mem::take(&mut self.incoming_withdrawn) {
+            // Self-trade prevention cancelled the incoming order; its cancel follows.
+            self.stats.unrested_quantity += remaining;
+            self.preempted.insert(ev.order_number);
+            return;
+        }
 
         // IOC and market orders never rest. The feed confirms this: every unfilled or partly
         // filled IOC is followed by a cancel within tens of microseconds, and fully filled
@@ -537,27 +779,64 @@ impl OrderBook {
             return;
         }
 
-        // Whatever is left rests. A partially filled iceberg keeps its tranche size, and
-        // shows at most one tranche.
-        let rest_visible = visible.min(remaining);
+        // Whatever is left rests. An iceberg's own trades use up its displayed tranche just as
+        // trades against it do: it starts with a full tranche (or, re-entered by a modify
+        // that kept its disclosed quantity, what was left of its tranche), each trade that
+        // takes the whole tranche leaves a fresh full one, and a smaller trade reduces it.
+        let tranche = if is_iceberg { visible } else { remaining };
+        let tranche_left = if is_iceberg {
+            let mut tl = self.carry_visible.take().unwrap_or(tranche);
+            let mut left = ev.volume_original;
+            for f in self
+                .fills
+                .iter()
+                .filter(|f| f.incoming_order == ev.order_number)
+            {
+                let vis = tl.min(left);
+                left -= f.quantity;
+                tl = if f.quantity >= vis {
+                    tranche
+                } else {
+                    tl - f.quantity
+                };
+            }
+            tl
+        } else {
+            remaining
+        };
+        self.insert_resting(Resting {
+            order_number: ev.order_number,
+            side: ev.side,
+            price: ev.price,
+            remaining,
+            tranche,
+            tranche_left,
+            is_iceberg,
+            placed_at: ev.timestamp,
+            algo_indicator: ev.algo_indicator,
+            client_identity: ev.client_identity,
+        });
+    }
+
+    /// Put an order at the back of its price's queue.
+    fn insert_resting(&mut self, r: Resting) {
+        let visible = r.tranche_left.min(r.remaining);
         self.next_seq += 1;
         let seq = self.next_seq;
         let order = BookOrder {
             seq,
-            side: ev.side,
-            price: ev.price,
-            visible: rest_visible,
-            tranche: if is_iceberg {
-                ev.volume_disclosed
-            } else {
-                remaining
-            },
-            hidden: remaining - rest_visible,
-            remaining,
-            is_iceberg,
+            side: r.side,
+            price: r.price,
+            visible,
+            tranche: r.tranche,
+            tranche_left: r.tranche_left,
+            hidden: r.remaining - visible,
+            remaining: r.remaining,
+            is_iceberg: r.is_iceberg,
             revealed: false,
-            algo_indicator: ev.algo_indicator,
-            client_identity: ev.client_identity,
+            placed_at: r.placed_at,
+            algo_indicator: r.algo_indicator,
+            client_identity: r.client_identity,
         };
 
         if order.hidden > 0 {
@@ -565,18 +844,23 @@ impl OrderBook {
             self.active_icebergs += 1;
         }
 
-        let level = match ev.side {
-            Side::Buy => self.bids.entry(ev.price).or_default(),
-            Side::Sell => self.asks.entry(ev.price).or_default(),
+        let level = match r.side {
+            Side::Buy => self.bids.entry(r.price).or_default(),
+            Side::Sell => self.asks.entry(r.price).or_default(),
         };
         level.visible += order.visible;
         level.hidden += order.hidden;
-        level.queue.push_back((ev.order_number, seq));
-        self.orders.insert(ev.order_number, order);
+        level.queue.push_back((r.order_number, seq));
+        self.orders.insert(r.order_number, order);
     }
 
     /// Match an incoming order against the resting book. Returns the quantity filled.
     fn match_incoming(&mut self, ev: &OrderEvent, mut remaining: i64) -> i64 {
+        self.incoming_withdrawn = false;
+        self.print_break = false;
+        if let Some(trades) = self.forced.take() {
+            return self.match_forced(ev, trades);
+        }
         let mut filled = 0i64;
         self.sweep_steps = 0;
 
@@ -596,6 +880,10 @@ impl OrderBook {
             }
 
             let taken = self.match_at_price(ev, price, remaining);
+            if self.incoming_withdrawn {
+                filled += taken;
+                break;
+            }
             if taken == 0 {
                 // Nothing available here and the level is exhausted; drop it and continue so
                 // the loop cannot spin on an empty level.
@@ -631,17 +919,24 @@ impl OrderBook {
                 continue;
             }
 
-            // The exchange is about to cancel this resting order: self-trade prevention. It
-            // must not trade; withdraw it now, as the matching engine did.
-            let could_be_same_client = self
-                .orders
-                .get(&id)
-                .is_some_and(|o| ev.same_client_possible(o.algo_indicator, o.client_identity));
-            if could_be_same_client && self.cancelled_at_step(id, ev.timestamp, self.sweep_steps) {
+            // Self-trade prevention: the exchange cancelled this resting order at the step of
+            // the match that reached it. It must not trade; withdraw it now, as the exchange
+            // did. The feed has no client identifier, and the participant category is not one:
+            // the same client trades as custodian and non-custodian, and the exchange stops
+            // those trading with each other. The cancel's slot, to half a jiffy, is the
+            // evidence. Coming back to the order this incoming order is already trading with
+            // (its next tranche) continues that trade and cannot be a prevention.
+            let continuing = self
+                .fills
+                .last()
+                .is_some_and(|f| f.resting_order == id && f.incoming_order == ev.order_number);
+            if !continuing && self.cancelled_at_step(id, ev.timestamp, self.sweep_steps) {
                 self.remove(id);
                 self.preempted.insert(id);
                 self.stats.self_trade_preventions += 1;
                 self.sweep_steps += 1;
+                // The cancel is a message of its own: whatever trades next is a new record.
+                self.print_break = true;
                 match self.level_mut(opposite, price) {
                     Some(lvl) => {
                         lvl.queue.pop_front();
@@ -650,11 +945,20 @@ impl OrderBook {
                 }
                 continue;
             }
+            // Or the exchange cancels the incoming order instead: its own cancel sits in this
+            // step's slot. Nothing more of it trades and nothing of it rests.
+            if !continuing
+                && self.cancelled_at_step(ev.order_number, ev.timestamp, self.sweep_steps)
+            {
+                self.incoming_withdrawn = true;
+                self.stats.self_trade_preventions += 1;
+                break;
+            }
 
             let order = self.orders.get(&id).expect("checked live");
             if order.visible <= 0 {
                 if order.is_iceberg && order.remaining > 0 {
-                    self.reveal_tranche(id, opposite, price);
+                    self.reveal_tranche(id, opposite, price, ev.timestamp);
                     // Revealed liquidity goes behind whatever is already queued.
                     let lvl = self.level_mut(opposite, price).expect("level exists");
                     lvl.queue.pop_front();
@@ -671,6 +975,7 @@ impl OrderBook {
                 break;
             }
             order.visible -= fill;
+            order.tranche_left -= fill;
             order.remaining -= fill;
             let exhausted = order.remaining <= 0;
             let reveal_next = order.visible <= 0 && order.is_iceberg && !exhausted;
@@ -686,14 +991,18 @@ impl OrderBook {
             // tranche comes straight back to the front, and the exchange prints the whole
             // execution as a single trade rather than one per tranche. If anything else traded
             // in between, the fills are genuinely separate trades and stay separate.
+            let mut continued = false;
+            let may_merge = !std::mem::take(&mut self.print_break);
             match self.fills.last_mut() {
                 Some(last)
-                    if last.resting_order == id
+                    if may_merge
+                        && last.resting_order == id
                         && last.incoming_order == ev.order_number
                         && last.price == rest_price =>
                 {
                     last.quantity += fill;
                     last.from_hidden |= from_hidden;
+                    continued = true;
                 }
                 _ => {
                     self.fills.push(Fill {
@@ -721,10 +1030,15 @@ impl OrderBook {
                     }
                 }
             } else if reveal_next {
-                self.reveal_tranche(id, opposite, price);
+                self.reveal_tranche(id, opposite, price, ev.timestamp);
                 let lvl = self.level_mut(opposite, price).expect("level exists");
                 lvl.queue.pop_front();
                 lvl.queue.push_back((id, seq));
+            } else if continued {
+                // This trade used up a whole tranche and went on into the next one. The
+                // exchange then shows a fresh full tranche, not what is left of the one it
+                // broke into.
+                self.refresh_tranche(id, opposite, price);
             }
             // Otherwise the order still shows quantity and keeps the front of the queue;
             // `taken` has reached `want` by construction, so the loop ends.
@@ -740,7 +1054,206 @@ impl OrderBook {
     }
 
     /// Make the next hidden tranche of an iceberg visible.
-    fn reveal_tranche(&mut self, id: u64, side: Side, price: i64) {
+    /// Fill an incoming order from the known executions instead of the matching rules.
+    fn match_forced(&mut self, ev: &OrderEvent, trades: Vec<KnownTrade>) -> i64 {
+        let mut filled = 0;
+        for t in trades {
+            if !self.orders.contains_key(&t.resting_order) {
+                self.forced_unknown += 1;
+                self.forced_shortfall += t.quantity;
+                continue;
+            }
+            // Each known trade is one record of the exchange's: never merged with the last.
+            self.print_break = true;
+            let got = self.take_resting(
+                t.resting_order,
+                t.quantity,
+                ev.order_number,
+                ev.side,
+                ev.timestamp,
+            );
+            self.forced_shortfall += t.quantity - got;
+            filled += got;
+        }
+        self.stats.volume_matched += filled;
+        filled
+    }
+
+    /// Take up to `want` from one resting order wherever it is queued, revealing tranches as
+    /// they run out. Returns the quantity taken.
+    fn take_resting(
+        &mut self,
+        id: u64,
+        mut want: i64,
+        incoming: u64,
+        aggressor: Side,
+        ts: i64,
+    ) -> i64 {
+        let mut taken = 0;
+        while want > 0 {
+            let Some(o) = self.orders.get_mut(&id) else {
+                break;
+            };
+            let (side, price) = (o.side, o.price);
+            if o.visible <= 0 {
+                if o.hidden > 0 {
+                    self.reveal_tranche(id, side, price, ts);
+                    self.requeue_back(id);
+                    continue;
+                }
+                break;
+            }
+            let fill = want.min(o.visible);
+            o.visible -= fill;
+            o.tranche_left -= fill;
+            o.remaining -= fill;
+            let from_hidden = o.revealed;
+            let exhausted = o.remaining <= 0;
+            let reveal_next = o.visible <= 0 && o.hidden > 0;
+            if let Some(l) = self.level_mut(side, price) {
+                l.visible -= fill;
+            }
+            let mut continued = false;
+            let may_merge = !std::mem::take(&mut self.print_break);
+            match self.fills.last_mut() {
+                Some(last)
+                    if may_merge
+                        && last.resting_order == id
+                        && last.incoming_order == incoming
+                        && last.price == price =>
+                {
+                    last.quantity += fill;
+                    last.from_hidden |= from_hidden;
+                    continued = true;
+                }
+                _ => {
+                    self.fills.push(Fill {
+                        price,
+                        quantity: fill,
+                        resting_order: id,
+                        incoming_order: incoming,
+                        from_hidden,
+                        timestamp: ts,
+                        aggressor,
+                    });
+                    self.stats.trades_generated += 1;
+                }
+            }
+            taken += fill;
+            want -= fill;
+            if exhausted {
+                self.orders.remove(&id);
+                if let Some(l) = self.level_mut(side, price) {
+                    if l.visible <= 0 && l.hidden <= 0 {
+                        self.drop_level(side, price);
+                    }
+                }
+                break;
+            }
+            if reveal_next {
+                self.reveal_tranche(id, side, price, ts);
+                self.requeue_back(id);
+            } else if continued {
+                self.refresh_tranche(id, side, price);
+            }
+        }
+        taken
+    }
+
+    /// Show a full tranche again: visible becomes the tranche size (or what remains), taken
+    /// from the hidden quantity.
+    fn refresh_tranche(&mut self, id: u64, side: Side, price: i64) {
+        let Some(o) = self.orders.get_mut(&id) else {
+            return;
+        };
+        if !o.is_iceberg {
+            return;
+        }
+        o.tranche_left = o.tranche;
+        let full = o.tranche.min(o.remaining);
+        let delta = full - o.visible;
+        if delta <= 0 {
+            return;
+        }
+        let had_hidden = o.hidden > 0;
+        o.visible = full;
+        o.hidden -= delta;
+        let now_hidden = o.hidden > 0;
+        self.resting_hidden -= delta;
+        if had_hidden && !now_hidden {
+            self.active_icebergs -= 1;
+        }
+        if let Some(l) = self.level_mut(side, price) {
+            l.visible += delta;
+            l.hidden -= delta;
+        }
+    }
+
+    /// What is left of the current tranche, if a modify re-enters an iceberg that carries its
+    /// tranche over (see [`carries_tranche`]).
+    fn carried_tranche(&self, ev: &OrderEvent) -> Option<i64> {
+        let o = self.orders.get(&ev.order_number)?;
+        (carries_tranche(o, ev) && o.tranche_left > 0).then_some(o.tranche_left)
+    }
+
+    /// The closing price: the volume-weighted average price of trades from 15:00 to 15:30,
+    /// truncated to whole paise and rounded to the nearest tick. Checked against the
+    /// post-close trades of 240 security-sessions, all exact. Falls back to the last traded
+    /// price when nothing traded in that half hour.
+    pub fn closing_price(&self) -> Option<i64> {
+        let (pq, q) = self.close_vwap;
+        if q > 0 {
+            let paise = (pq / q) as i64;
+            Some((paise + TICK / 2) / TICK * TICK)
+        } else {
+            self.last_trade_price
+        }
+    }
+
+    /// In the post-close session every order trades at the closing price, in time priority,
+    /// and a market order waits for a counterparty like any other. The continuous session's
+    /// orders take no part: the exchange cancels them as the session opens, and the book
+    /// clears them here so the cancels, when they arrive, are recognised.
+    fn closing_session_view(&mut self, ev: &OrderEvent) -> OrderEvent {
+        if ev.timestamp.rem_euclid(DAY_MICROS) < CLOSING_SESSION_FROM {
+            return *ev;
+        }
+        if self.closing_price.is_none() {
+            let Some(price) = self.closing_price() else {
+                return *ev;
+            };
+            self.closing_price = Some(price);
+            for (id, _) in self.orders.drain() {
+                self.preempted.insert(id);
+            }
+            self.bids.clear();
+            self.asks.clear();
+            self.resting_hidden = 0;
+            self.active_icebergs = 0;
+        }
+        let mut e = *ev;
+        if matches!(e.activity_type, ENTRY | MODIFY) {
+            e.price = self.closing_price.expect("set above");
+            e.market = false;
+        }
+        e
+    }
+
+    /// Give an order a new placement at the back of its price's queue.
+    fn requeue_back(&mut self, id: u64) {
+        self.next_seq += 1;
+        let seq = self.next_seq;
+        let Some(o) = self.orders.get_mut(&id) else {
+            return;
+        };
+        o.seq = seq;
+        let (side, price) = (o.side, o.price);
+        if let Some(l) = self.level_mut(side, price) {
+            l.queue.push_back((id, seq));
+        }
+    }
+
+    fn reveal_tranche(&mut self, id: u64, side: Side, price: i64, ts: i64) {
         let Some(order) = self.orders.get_mut(&id) else {
             return;
         };
@@ -748,9 +1261,11 @@ impl OrderBook {
         if reveal <= 0 {
             return;
         }
+        order.tranche_left = order.tranche;
         order.visible = reveal;
         order.hidden = order.remaining - reveal;
         order.revealed = true;
+        order.placed_at = ts;
         let still_hidden = order.hidden > 0;
         if let Some(lvl) = self.level_mut(side, price) {
             lvl.visible += reveal;
@@ -912,7 +1427,7 @@ impl OrderBook {
 }
 
 impl Side {
-    fn opposite(self) -> Side {
+    pub fn opposite(self) -> Side {
         match self {
             Side::Buy => Side::Sell,
             Side::Sell => Side::Buy,
@@ -922,6 +1437,9 @@ impl Side {
 
 #[cfg(test)]
 mod tests {
+    /// 10:00 in the continuous session; earlier times belong to the pre-open auction.
+    const T0: i64 = 10 * 3600 * 1_000_000;
+
     use super::*;
 
     fn ev(
@@ -939,7 +1457,7 @@ mod tests {
             price,
             volume_disclosed: disclosed,
             volume_original: original,
-            timestamp: id as i64,
+            timestamp: T0 + id as i64,
             algo_indicator: 1,
             client_identity: 3,
             ioc: false,
@@ -1092,14 +1610,14 @@ mod tests {
         // that would match it, and the buy's cancel 150 microseconds after the sell arrives.
         let mut b = OrderBook::new("TEST");
         let mut resting = limit(1, Side::Buy, 100_00, 10);
-        resting.timestamp = 1_000;
+        resting.timestamp = T0 + 1_000;
         let mut other = limit(2, Side::Buy, 100_00, 10);
-        other.timestamp = 1_001;
+        other.timestamp = T0 + 1_001;
         let mut incoming = limit(3, Side::Sell, 100_00, 10);
-        incoming.timestamp = 5_000;
+        incoming.timestamp = T0 + 5_000;
         // Stamped one feed tick after the incoming order: the first step of its sweep.
         let mut its_cancel = cancel(1, Side::Buy);
-        its_cancel.timestamp = 5_015;
+        its_cancel.timestamp = T0 + 5_015;
 
         for e in [&resting, &other, &incoming, &its_cancel] {
             b.announce(e);
@@ -1121,13 +1639,13 @@ mod tests {
     fn a_cancel_well_after_the_match_does_not_prevent_it() {
         let mut b = OrderBook::new("TEST");
         let mut resting = limit(1, Side::Buy, 100_00, 10);
-        resting.timestamp = 1_000;
+        resting.timestamp = T0 + 1_000;
         let mut incoming = limit(2, Side::Sell, 100_00, 4);
-        incoming.timestamp = 5_000;
+        incoming.timestamp = T0 + 5_000;
         // A client cancelling its remainder after being filled: 336 microseconds later, well
         // after the sweep, as in the case that exposed the fixed-window rule.
         let mut later = cancel(1, Side::Buy);
-        later.timestamp = 5_336;
+        later.timestamp = T0 + 5_336;
         for e in [&resting, &incoming, &later] {
             b.announce(e);
         }
@@ -1504,5 +2022,198 @@ mod tests {
         b.apply(&limit(100_001, Side::Buy, 100_00, 1));
         assert_eq!(b.last_fills()[0].resting_order, 50_000);
         assert_eq!(b.best_ask(), None);
+    }
+
+    fn at(h: i64, m: i64, sec: i64) -> i64 {
+        ((h * 60 + m) * 60 + sec) * 1_000_000
+    }
+
+    fn timed(mut e: OrderEvent, ts: i64) -> OrderEvent {
+        e.timestamp = ts;
+        e
+    }
+
+    fn client(mut e: OrderEvent, algo: u8, client: u8) -> OrderEvent {
+        e.algo_indicator = algo;
+        e.client_identity = client;
+        e
+    }
+
+    #[test]
+    fn an_iceberg_shows_a_fresh_tranche_after_a_trade_runs_into_its_next_one() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&ev(ENTRY, 1, Side::Sell, 100_00, 10, 100));
+        b.apply(&limit(2, Side::Buy, 100_00, 15)); // 10, then 5 of the next tranche
+        assert_eq!(b.last_fills().len(), 1, "one trade record");
+        assert_eq!(b.last_fills()[0].quantity, 15);
+        assert_eq!(
+            b.top_levels(Side::Sell, 1)[0],
+            (100_00, 10, 75),
+            "a full tranche shows, not the 5 left of the one it broke into"
+        );
+    }
+
+    #[test]
+    fn an_icebergs_own_trades_on_entry_use_up_its_tranche() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&limit(1, Side::Sell, 100_00, 3));
+        b.apply(&ev(ENTRY, 2, Side::Buy, 100_00, 10, 50));
+        assert_eq!(b.top_levels(Side::Buy, 1)[0], (100_00, 7, 40));
+    }
+
+    #[test]
+    fn a_modify_keeping_the_disclosed_quantity_keeps_what_is_left_of_the_tranche() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&ev(ENTRY, 1, Side::Sell, 100_05, 10, 100));
+        b.apply(&limit(2, Side::Buy, 100_05, 4));
+        b.apply(&ev(MODIFY, 1, Side::Sell, 100_10, 10, 96));
+        assert_eq!(b.top_levels(Side::Sell, 1)[0], (100_10, 6, 90));
+    }
+
+    #[test]
+    fn a_modify_changing_the_disclosed_quantity_shows_a_fresh_tranche() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&ev(ENTRY, 1, Side::Sell, 100_05, 10, 100));
+        b.apply(&limit(2, Side::Buy, 100_05, 4));
+        b.apply(&ev(MODIFY, 1, Side::Sell, 100_10, 20, 96));
+        assert_eq!(b.top_levels(Side::Sell, 1)[0], (100_10, 20, 76));
+    }
+
+    #[test]
+    fn priority_survives_a_modify_that_does_not_grow_the_display() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&ev(ENTRY, 1, Side::Sell, 100_00, 10, 100));
+        b.apply(&limit(2, Side::Sell, 100_00, 10));
+        b.apply(&ev(MODIFY, 1, Side::Sell, 100_00, 5, 100)); // shows 5 instead of 10
+        b.apply(&limit(3, Side::Buy, 100_00, 1));
+        assert_eq!(
+            b.last_fills()[0].resting_order,
+            1,
+            "still first in the queue"
+        );
+
+        b.apply(&ev(MODIFY, 1, Side::Sell, 100_00, 20, 99)); // shows 20: grows
+        b.apply(&limit(4, Side::Buy, 100_00, 1));
+        assert_eq!(b.last_fills()[0].resting_order, 2, "now behind order 2");
+    }
+
+    #[test]
+    fn self_trade_prevention_can_cancel_the_incoming_order() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&timed(
+            client(limit(1, Side::Sell, 100_00, 10), 0, 2),
+            T0 + 1_000,
+        ));
+        let incoming = timed(client(limit(2, Side::Buy, 100_00, 5), 1, 2), T0 + 5_000);
+        // The exchange cancels the incoming buy one tick after it arrives.
+        let its_cancel = timed(cancel(2, Side::Buy), T0 + 5_015);
+        b.announce(&its_cancel);
+        b.apply(&incoming);
+        assert!(b.last_fills().is_empty(), "the orders must not trade");
+        assert_eq!(b.best_bid(), None, "and the buy does not rest");
+        assert_eq!(b.best_ask(), Some(100_00), "the resting sell is untouched");
+        b.apply(&its_cancel);
+        assert_eq!(b.stats().unknown_order_refs, 0, "its cancel is recognised");
+    }
+
+    #[test]
+    fn a_self_trade_cancel_ends_the_trade_record() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&timed(ev(ENTRY, 1, Side::Sell, 100_00, 5, 20), T0 + 1_000));
+        b.apply(&timed(
+            client(limit(2, Side::Sell, 100_00, 5), 1, 2),
+            T0 + 1_001,
+        ));
+        // Buy 7: takes order 1's tranche (step 0), meets order 2 of its own client (step 1,
+        // cancelled by the exchange), then order 1 again.
+        let incoming = timed(client(limit(3, Side::Buy, 100_00, 7), 1, 2), T0 + 5_000);
+        b.announce(&timed(cancel(2, Side::Sell), T0 + 5_030));
+        b.apply(&incoming);
+        let q: Vec<(u64, i64)> = b
+            .last_fills()
+            .iter()
+            .map(|f| (f.resting_order, f.quantity))
+            .collect();
+        assert_eq!(q, vec![(1, 5), (1, 2)], "two records, split by the cancel");
+        assert_eq!(
+            b.top_levels(Side::Sell, 1)[0],
+            (100_00, 3, 10),
+            "the second record is an ordinary trade: 3 of the tranche left"
+        );
+    }
+
+    #[test]
+    fn the_post_close_session_trades_at_the_closing_price_in_time_order() {
+        let mut b = OrderBook::new("TEST");
+        let t = at(15, 10, 0);
+        b.apply(&timed(limit(1, Side::Sell, 100_00, 10), t));
+        b.apply(&timed(limit(2, Side::Buy, 100_00, 10), t + 1));
+        b.apply(&timed(limit(3, Side::Sell, 100_07, 10), t + 2));
+        b.apply(&timed(limit(4, Side::Buy, 100_07, 10), t + 3));
+        // Average 100.035: truncated to 100.03, then the nearest tick, 100.05.
+        assert_eq!(b.closing_price(), Some(100_05));
+
+        b.apply(&timed(limit(5, Side::Sell, 101_00, 50), t + 4)); // a day order, left over
+        b.apply(&timed(market(6, Side::Buy, 3), at(15, 40, 1)));
+        assert!(b.last_fills().is_empty(), "the day's orders take no part");
+        assert_eq!(
+            b.best_bid(),
+            Some(100_05),
+            "a market order waits at the close"
+        );
+        b.apply(&timed(market(7, Side::Sell, 2), at(15, 40, 2)));
+        let f = b.last_fills()[0];
+        assert_eq!((f.buy_order(), f.price, f.quantity), (6, 100_05, 2));
+        b.apply(&timed(cancel(5, Side::Sell), at(15, 40, 3)));
+        assert_eq!(b.stats().unknown_order_refs, 0);
+    }
+
+    #[test]
+    fn the_pre_open_auction_matches_at_one_price_in_priority_order() {
+        let mut b = OrderBook::new("TEST");
+        let t = at(9, 1, 0);
+        b.apply(&timed(limit(1, Side::Buy, 101_00, 10), t));
+        b.apply(&timed(market(2, Side::Buy, 5), t + 1));
+        b.apply(&timed(limit(3, Side::Sell, 99_00, 8), t + 2));
+        b.apply(&timed(limit(4, Side::Sell, 100_00, 10), t + 3));
+        b.apply(&timed(limit(5, Side::Buy, 100_00, 3), t + 4));
+        b.apply(&timed(limit(6, Side::Buy, 98_00, 7), t + 5));
+        assert_eq!(
+            b.best_bid(),
+            None,
+            "nothing matches or rests before the auction"
+        );
+
+        b.close_pre_open();
+        let trades: Vec<(u64, u64, i64, i64)> = b
+            .last_fills()
+            .iter()
+            .map(|f| (f.buy_order(), f.sell_order(), f.quantity, f.price))
+            .collect();
+        // 18 can trade at 100.00, more than at any other price. Limit buys by price, then
+        // the market buy; sells by price.
+        assert_eq!(
+            trades,
+            vec![
+                (1, 3, 8, 100_00),
+                (1, 4, 2, 100_00),
+                (5, 4, 3, 100_00),
+                (2, 4, 5, 100_00),
+            ]
+        );
+        assert_eq!(b.best_bid(), Some(98_00), "the unmatched buy rests");
+        assert_eq!(b.best_ask(), None);
+    }
+
+    #[test]
+    fn a_pre_open_modify_that_does_not_raise_quantity_keeps_time_priority() {
+        let mut b = OrderBook::new("TEST");
+        let t = at(9, 1, 0);
+        b.apply(&timed(limit(1, Side::Buy, 100_00, 10), t));
+        b.apply(&timed(limit(2, Side::Buy, 100_00, 10), t + 1));
+        b.apply(&timed(ev(MODIFY, 1, Side::Buy, 100_00, 0, 8), t + 2));
+        b.apply(&timed(limit(3, Side::Sell, 100_00, 1), t + 3));
+        b.close_pre_open();
+        assert_eq!(b.last_fills()[0].buy_order(), 1);
     }
 }

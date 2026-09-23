@@ -28,7 +28,7 @@ so the Python and Rust views of a layout cannot disagree.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
 from ._native import (
     BatchReader,
@@ -125,6 +125,7 @@ def build_books(
     compression: str = "snappy",
     max_records: int | None = None,
     symbols: Sequence[str] | None = None,
+    previous_close: Mapping[str, int] | None = None,
 ) -> dict:
     """Reconstruct limit order books and write periodic L2 snapshots as Parquet.
 
@@ -140,6 +141,10 @@ def build_books(
 
     Every symbol's book is independent, so the replay fans out across ``threads`` and covers
     the whole session in a single pass over the file.
+
+    ``previous_close`` maps a symbol to its previous session's closing price in paise. It is
+    only needed to break a tie between equally good pre-open auction prices, which the exchange
+    settles by closeness to the previous close; without it the lowest such price is taken.
     """
     return _native_build_books(
         input,
@@ -152,10 +157,16 @@ def build_books(
         compression=compression,
         max_records=max_records,
         symbols=list(symbols) if symbols is not None else None,
+        previous_close=dict(previous_close) if previous_close is not None else None,
     )
 
 
-def replay_fills(input: str, *, symbols: Sequence[str] | None = None) -> "pa.Table":
+def replay_fills(
+    input: str,
+    *,
+    symbols: Sequence[str] | None = None,
+    previous_close: Mapping[str, int] | None = None,
+) -> "pa.Table":
     """Every trade the order book replay generates, as a ``pyarrow.Table``.
 
     ``input`` is a directory of parsed Capital Market orders (the ``date=...`` directory with
@@ -164,10 +175,16 @@ def replay_fills(input: str, *, symbols: Sequence[str] | None = None) -> "pa.Tab
     result can be joined to the parsed trades on the two order numbers to check which trades
     the replay reproduces. ``txn_time`` is the time of the incoming order's event; the exchange
     stamps its own trades about 15 microseconds per trade later, so join on order numbers.
+
+    ``previous_close`` is as for :func:`build_books`.
     """
     import pyarrow as pa
 
-    batch = _native_replay_fills(input, list(symbols) if symbols is not None else None)
+    batch = _native_replay_fills(
+        input,
+        list(symbols) if symbols is not None else None,
+        dict(previous_close) if previous_close is not None else None,
+    )
     return pa.Table.from_batches([batch])
 
 

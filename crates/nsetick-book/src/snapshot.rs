@@ -318,6 +318,9 @@ impl SnapshotBuilder {
 
 #[cfg(test)]
 mod tests {
+    /// 10:00 in the continuous session; earlier times belong to the pre-open auction.
+    const T0: i64 = 10 * 3600 * 1_000_000;
+
     use super::*;
     use crate::book::{OrderEvent, ENTRY};
     use arrow::array::{Array, Int64Array, StringArray};
@@ -330,7 +333,7 @@ mod tests {
             price,
             volume_disclosed: disclosed,
             volume_original: qty,
-            timestamp: id as i64,
+            timestamp: T0 + id as i64,
             algo_indicator: 1,
             client_identity: 3,
             ioc: false,

@@ -8,7 +8,8 @@ compares the result with the parsed trade file, trade by trade:
   order volume   each order executes the same total quantity
   volume         total quantity matched, as a share of what the exchange printed
 
-Continuous session only (from 09:15); the pre-open call auction matches by a different rule.
+The whole day by default: the pre-open call auction, the continuous session and the post-close
+session. ``--continuous-only`` starts at 09:15.
 
     python tools/verify_replay.py PARSED_ROOT [--symbols TCS INFY] [--dates 2022-01-25 ...]
 
@@ -42,7 +43,7 @@ def sessions(root: Path) -> list[tuple[str, Path, Path]]:
     return out
 
 
-def verify(orders: Path, trades: Path, symbols: list[str] | None) -> list[tuple]:
+def verify(orders: Path, trades: Path, symbols: list[str] | None, since: str) -> list[tuple]:
     fills = nsetick.replay_fills(str(orders), symbols=symbols)
     con = duckdb.connect()
     con.execute("SET enable_progress_bar=false")
@@ -55,11 +56,11 @@ def verify(orders: Path, trades: Path, symbols: list[str] | None) -> list[tuple]
         CREATE TABLE a AS SELECT symbol, buy_order_number b, sell_order_number s,
                trade_price p, trade_quantity q
         FROM read_parquet('{trades.as_posix()}/*/*.parquet', hive_partitioning = true)
-        WHERE CAST(txn_time AS TIME) >= TIME '09:15:00' {sym_filter}""")
-    con.execute("""
+        WHERE CAST(txn_time AS TIME) >= TIME '{since}' {sym_filter}""")
+    con.execute(f"""
         CREATE TABLE r AS SELECT symbol, buy_order_number b, sell_order_number s,
                trade_price p, trade_quantity q
-        FROM replay WHERE CAST(txn_time AS TIME) >= TIME '09:15:00'""")
+        FROM replay WHERE CAST(txn_time AS TIME) >= TIME '{since}'""")
     return con.execute("""
         WITH
         ak AS (SELECT *, ROW_NUMBER() OVER (PARTITION BY symbol, b, s, p, q) k FROM a),
@@ -89,6 +90,8 @@ def main() -> int:
     ap.add_argument("root", type=Path)
     ap.add_argument("--symbols", nargs="*")
     ap.add_argument("--dates", nargs="*", help="YYYY-MM-DD or DDMMYYYY, as in the directory names")
+    ap.add_argument("--continuous-only", action="store_true",
+                    help="compare trades from 09:15 only, leaving out the pre-open auction")
     args = ap.parse_args()
 
     found = sessions(args.root)
@@ -98,18 +101,19 @@ def main() -> int:
         print(f"no sessions with both orders and trades under {args.root}", file=sys.stderr)
         return 1
 
-    print(f"{'session':10s} {'symbol':11s} {'trades':>9s} {'exact':>7s} {'pairs':>7s} {'orders':>7s} {'volume':>8s}")
+    print(f"{'session':10s} {'symbol':11s} {'trades':>9s} {'missed':>7s} {'exact':>8s} {'pairs':>8s} {'orders':>8s} {'volume':>8s}")
     tot = [0] * 8
     for date, orders, trades in found:
-        for row in verify(orders, trades, args.symbols):
+        since = "09:15:00" if args.continuous_only else "00:00:00"
+        for row in verify(orders, trades, args.symbols, since):
             sym, n, hit, pn, phit, on, ohit, vq, rq = row
-            print(f"{date:10s} {sym:11s} {n:9,d} {100*hit/n:6.1f}% {100*phit/pn:6.1f}% "
-                  f"{100*ohit/on:6.1f}% {100*rq/vq:7.1f}%")
+            print(f"{date:10s} {sym:11s} {n:9,d} {n-hit:7,d} {100*hit/n:7.2f}% {100*phit/pn:7.2f}% "
+                  f"{100*ohit/on:7.2f}% {100*rq/vq:7.2f}%")
             for i, v in enumerate((n, hit, pn, phit, on, ohit, vq, rq)):
                 tot[i] += v
     n, hit, pn, phit, on, ohit, vq, rq = tot
-    print(f"\n{'ALL':10s} {'':11s} {n:9,d} {100*hit/n:6.1f}% {100*phit/pn:6.1f}% "
-          f"{100*ohit/on:6.1f}% {100*rq/vq:7.1f}%")
+    print(f"\n{'ALL':10s} {'':11s} {n:9,d} {n-hit:7,d} {100*hit/n:7.3f}% {100*phit/pn:7.3f}% "
+          f"{100*ohit/on:7.3f}% {100*rq/vq:7.3f}%")
     return 0
 
 
