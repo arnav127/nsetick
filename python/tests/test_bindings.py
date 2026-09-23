@@ -67,6 +67,33 @@ def ampersand_symbol(sample):
     return hits[0]
 
 
+@pytest.fixture(scope="session")
+def probed():
+    """What the file under test actually is.
+
+    The data tests used to assume a cash-market orders file - its record length, its
+    ``limit_price`` field, a symbol that happens to sit at the head of that file - so pointing
+    NSETICK_TEST_FILE at a trades file failed three tests over a library that was working.
+    Everything file-specific is now read off the file.
+    """
+    p = nsetick.probe(TEST_FILE)
+    fields = {f["name"]: f for f in nsetick.describe(p["layout"], date=p["session_date"])["fields"]}
+    price = next(n for n in ("limit_price", "trade_price") if n in fields)
+    return {**p, "fields": fields, "price_field": price}
+
+
+@pytest.fixture(scope="session")
+def present_symbol(sample):
+    """A symbol that occurs in the sample, with enough rows to be a meaningful filter."""
+    counts: dict = {}
+    for batch in nsetick.iter_batches(sample, select=["symbol"]):
+        for s in batch.column("symbol").to_pylist():
+            counts[s] = counts.get(s, 0) + 1
+    if not counts:
+        pytest.skip("sample holds no records")
+    return max(counts, key=counts.get)
+
+
 def test_version_is_exposed():
     assert nsetick.__version__.count(".") == 2
 
@@ -159,25 +186,30 @@ def test_unknown_layout_is_rejected():
 
 
 @needs_data
-def test_probe_identifies_the_file():
-    p = nsetick.probe(TEST_FILE)
-    assert p["observed_record_length"] == 87
-    assert p["layout"] == "cm_orders"
+def test_probe_identifies_the_file(probed):
+    # The observed record length must agree with the spec the probe selected: this is the
+    # check that catches a file parsed against the wrong layout revision.
+    expected = nsetick.describe(probed["layout"], date=probed["session_date"])["record_length"]
+    assert probed["layout"] in nsetick.layouts()
+    assert probed["observed_record_length"] == expected
+    assert probed["verified"] is True
 
 
 @needs_data
-def test_streaming_yields_arrow_batches_with_the_projected_schema(sample):
+def test_streaming_yields_arrow_batches_with_the_projected_schema(sample, probed, present_symbol):
+    price = probed["price_field"]
     reader = nsetick.iter_batches(
         sample,
-        where="symbol == 'BAJAJ-AUTO'",
-        select=["symbol", "txn_time", "limit_price"],
+        where=f"symbol == '{present_symbol}'",
+        select=["symbol", price, "txn_time"],
     )
     # Schema follows layout order, not the order fields were requested in.
-    assert [f.name for f in reader.schema] == ["txn_time", "symbol", "limit_price"]
+    by_offset = sorted(["symbol", price, "txn_time"], key=lambda n: probed["fields"][n]["offset"])
+    assert [f.name for f in reader.schema] == by_offset
 
     batch = next(iter(reader))
     assert batch.num_rows > 0
-    assert set(batch.column("symbol").to_pylist()) == {"BAJAJ-AUTO"}
+    assert set(batch.column("symbol").to_pylist()) == {present_symbol}
 
     s = reader.stats
     assert s["rows_read"] > s["rows_emitted"] > 0
@@ -208,10 +240,11 @@ def test_symbols_containing_ampersands_survive(sample, ampersand_symbol):
 
 
 @needs_data
-def test_price_scale_travels_in_field_metadata(sample):
-    t = nsetick.read_table(sample, select=["limit_price"], max_rows=1)
-    meta = t.schema.field("limit_price").metadata
-    assert meta[b"scale"] == b"2"
+def test_price_scale_travels_in_field_metadata(sample, probed):
+    price = probed["price_field"]
+    t = nsetick.read_table(sample, select=[price], max_rows=1)
+    meta = t.schema.field(price).metadata
+    assert meta[b"scale"] == str(probed["fields"][price]["scale"]).encode()
 
 
 @needs_data
