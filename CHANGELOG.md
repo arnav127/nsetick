@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- **Book snapshots fall on the clock.** `snapshot_time` is now a whole multiple of the interval
+  counted from midnight (10:00:00, 10:00:01, ... for a 1-second interval), instead of counting
+  from the first event of the session (10:00:00.154647, ...). Snapshots from different
+  securities and sessions now line up, and a lookup at an exact time finds a row. The book
+  content is unchanged: each snapshot is still the book as of that instant.
+
 ## 0.2.0
 
 Order book reconstruction now reproduces the exchange's own trade records exactly. **Books

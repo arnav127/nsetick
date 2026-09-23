@@ -22,7 +22,9 @@ books; parse with all fields (the default) so the order-type flags are available
 ## Snapshot columns
 
 One row per symbol per interval, showing the book **as of** `snapshot_time`: events at or after
-that instant are not yet applied.
+that instant are not yet applied. Snapshot times fall on the clock, at whole multiples of the
+interval from midnight: with `interval_secs=60`, 09:01:00, 09:02:00, and so on, the same for
+every security, so snapshots from different securities line up row for row.
 
 | Column | Meaning |
 |---|---|

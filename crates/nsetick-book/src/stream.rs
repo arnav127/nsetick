@@ -29,6 +29,15 @@ impl std::ops::AddAssign for Progress {
     }
 }
 
+/// The first snapshot time after `ts`: the next whole multiple of `interval` counted from
+/// midnight, so snapshots fall on the clock (10:00:00, 10:01:00, ...) whatever time the first
+/// event arrives. Timestamps are IST wall clock, so midnight is a multiple of a day.
+fn first_boundary(ts: i64, interval: i64) -> i64 {
+    const DAY: i64 = 86_400 * 1_000_000;
+    let midnight = ts - ts.rem_euclid(DAY);
+    midnight + ((ts - midnight) / interval + 1) * interval
+}
+
 pub struct SymbolReplay {
     pub book: OrderBook,
     /// Next snapshot boundary, in the feed's microseconds; `None` until the first event.
@@ -115,7 +124,9 @@ impl SymbolReplay {
             events: 1,
             ..Default::default()
         };
-        let next = self.next_snapshot.get_or_insert(ev.timestamp + interval);
+        let next = self
+            .next_snapshot
+            .get_or_insert_with(|| first_boundary(ev.timestamp, interval));
         // Snapshot the state *before* applying an event that crosses the boundary, so a
         // snapshot reflects the book as of that instant.
         while ev.timestamp >= *next {
@@ -187,6 +198,43 @@ mod tests {
         );
         assert_eq!(r.book.stats().self_trade_preventions, 1);
         assert_eq!(r.book.best_ask(), Some(100_00), "the sell rests");
+    }
+
+    #[test]
+    fn snapshots_fall_on_whole_multiples_of_the_interval() {
+        assert_eq!(first_boundary(T0 + 154_647, 60_000_000), T0 + 60_000_000);
+        assert_eq!(
+            first_boundary(T0 + 60_000_000, 60_000_000),
+            T0 + 120_000_000
+        );
+        assert_eq!(first_boundary(T0 + 1, 1_000_000), T0 + 1_000_000);
+        assert_eq!(first_boundary(T0 + 1, 250_000), T0 + 250_000);
+
+        let mut r = SymbolReplay::new("TEST");
+        let mut sb = SnapshotBuilder::new(1);
+        let mut p = Progress::default();
+        p += r.feed(
+            &event(ENTRY, 1, Side::Buy, 100_00, 10, 1_234_567),
+            &mut sb,
+            1_000_000,
+        );
+        p += r.feed(
+            &event(ENTRY, 2, Side::Sell, 101_00, 10, 3_500_000),
+            &mut sb,
+            1_000_000,
+        );
+        p += r.finish(&mut sb, 1_000_000);
+        let batch = sb.finish().expect("batch");
+        let times = batch
+            .column_by_name("snapshot_time")
+            .expect("column")
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .expect("timestamps")
+            .values()
+            .to_vec();
+        assert_eq!(times, vec![T0 + 2_000_000, T0 + 3_000_000]);
+        assert_eq!(p.snapshots, 2);
     }
 
     #[test]
