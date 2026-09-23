@@ -9,6 +9,7 @@
 - [Parsing](Parsing)
 - [Filter Language](Filter-Language)
 - [Order Book Reconstruction](Order-Book-Reconstruction)
+- [Matching Engine](Matching-Engine)
 
 **Reference**
 - [Data Layouts and Quirks](Data-Layouts-and-Quirks)

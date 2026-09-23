@@ -345,7 +345,7 @@ mod tests {
         // 6 header + 2 sides * levels * 3 + 2 sides * 5 touch + 6 interval + 7 trailer
         let fixed = 6 + 2 * 5 + 6 + 7;
         assert_eq!(schema(5).fields().len(), fixed + 2 * 5 * 3);
-        assert_eq!(schema(1).fields().len(), fixed + 2 * 1 * 3);
+        assert_eq!(schema(1).fields().len(), fixed + 2 * 3); // two sides x one level x three columns
     }
 
     #[test]

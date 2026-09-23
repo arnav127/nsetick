@@ -40,6 +40,7 @@ from ._native import (
     run_spec,
 )
 from ._native import build_books as _native_build_books
+from ._native import replay_fills as _native_replay_fills
 from ._native import parse as _native_parse
 from ._native import version as _native_version
 
@@ -59,6 +60,7 @@ __all__ = [
     "parse",
     "probe",
     "read_table",
+    "replay_fills",
     "run_spec",
     "to_pandas",
     "to_polars",
@@ -151,6 +153,22 @@ def build_books(
         max_records=max_records,
         symbols=list(symbols) if symbols is not None else None,
     )
+
+
+def replay_fills(input: str, *, symbols: Sequence[str] | None = None) -> "pa.Table":
+    """Every trade the order book replay generates, as a ``pyarrow.Table``.
+
+    ``input`` is a directory of parsed Capital Market orders (the ``date=...`` directory with
+    ``symbol=*`` partitions) or a single parquet file. Columns follow the exchange's trade file
+    - ``buy_order_number``, ``sell_order_number``, ``trade_price``, ``trade_quantity`` - so the
+    result can be joined to the parsed trades on the two order numbers to check which trades
+    the replay reproduces. ``txn_time`` is the time of the incoming order's event; the exchange
+    stamps its own trades about 15 microseconds per trade later, so join on order numbers.
+    """
+    import pyarrow as pa
+
+    batch = _native_replay_fills(input, list(symbols) if symbols is not None else None)
+    return pa.Table.from_batches([batch])
 
 
 def iter_batches(

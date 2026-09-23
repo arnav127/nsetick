@@ -195,7 +195,7 @@ impl Decoder {
         let line = self.line_length();
         let reclen = self.version.record_length;
 
-        if buf.len() % line != 0 {
+        if !buf.len().is_multiple_of(line) {
             bail!(
                 "buffer of {} bytes is not a whole number of {line}-byte records \
                  (layout {} expects {reclen}-byte records plus LF); {} bytes left over",

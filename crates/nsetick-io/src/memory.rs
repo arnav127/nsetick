@@ -330,7 +330,7 @@ mod tests {
     fn default_limits_are_sane_for_this_machine() {
         let (footprint, buffer) = default_limits(512 * 1024 * 1024);
         assert!(footprint >= FOOTPRINT_FLOOR);
-        assert!(buffer >= BUFFER_FLOOR && buffer <= BUFFER_CEILING);
+        assert!((BUFFER_FLOOR..=BUFFER_CEILING).contains(&buffer));
         assert!(buffer < footprint);
     }
 

@@ -245,7 +245,8 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
     if req.levels == 0 {
         bail!("levels must be at least 1");
     }
-    if !(req.interval_secs > 0.0) {
+    // Written to reject NaN as well as zero and negative values.
+    if req.interval_secs.is_nan() || req.interval_secs <= 0.0 {
         bail!("interval_secs must be positive, got {}", req.interval_secs);
     }
 

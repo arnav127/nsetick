@@ -52,47 +52,38 @@ which is why they are captured here.
 
 ## Matching rules
 
-The replay implements these NSE behaviours. Each was checked against the exchange's trade
-file — see [Validation and Accuracy](Validation-and-Accuracy).
+The replay follows NSE's matching rules, including the exchange-specific ones: market orders
+priced at zero, IOC remainders that never rest, stop-loss orders held until the feed reports
+their trigger, self-trade prevention, disclosed-quantity (iceberg) orders whose new tranches
+lose priority, and modifies that keep or lose queue position. The
+**[Matching Engine](Matching-Engine)** page explains every step, with diagrams and a worked
+example.
 
-**Price–time priority.** Better prices first; at a price, earlier orders first. Fills print at
-the resting order's price.
+In short:
 
-**Disclosed quantity.** An order with `0 < volume_disclosed < volume_original` shows only the
-disclosed amount. The rest is real liquidity that nobody else can see.
-
-**Replenishment loses priority.** When the visible tranche of a disclosed-quantity order is
-used up, the next tranche is revealed and joins the **back** of the queue at its price.
-
-**A modify is cancel-then-enter.** Activity type 4 removes the order and re-enters it, so it
-loses its place in the queue. The modify carries the order's *remaining* quantity, not its
-original total.
-
-**Market orders** have a limit price of zero in the file. They take liquidity at any price and
-never rest.
-
-**Immediate-or-cancel** orders never rest: whatever does not fill on entry is discarded. The
-file records a cancel for the remainder a few microseconds later; the replay recognises it.
-
-**Stop-loss** orders wait off the book until the last traded price reaches their trigger (at or
-above it for a buy, at or below for a sell), then enter as ordinary orders.
-
-**Self-trade prevention.** When an incoming order would match a resting order from the same
-client, NSE cancels the resting order instead. The file carries no client identifier, but it
-records that cancel a few hundred microseconds after the incoming order. The replay reads 1 ms
-ahead of the event it is applying and withdraws a resting order the exchange is about to cancel.
+- **Price-time priority**, with every fill at the resting order's price.
+- An order that can trade on arrival does so at once. Whatever is left **rests** at the back
+  of its price's queue, unless it is IOC or a market order, in which case it is **discarded**.
+- **Icebergs** show one tranche at a time. Each new tranche goes to the back of the queue.
+- A **modify** that only lowers the quantity keeps the order's place. Any other modify is
+  cancel-then-enter.
+- **Stop-loss** orders wait off the book until the feed's trigger record.
+- **Self-trade prevention**: a resting order the exchange cancelled when a same-client order
+  reached it is withdrawn, not traded.
 
 ## What the replay cannot know
 
 - **Pre-open auction.** Orders entered 09:00–09:08 are matched by call auction at a single
   price. The replay matches them continuously as they arrive, so the book before 09:15 is
   approximate. Use snapshots from 09:15 onward.
-- **Queue position after events it cannot see.** Anything the exchange did that leaves no
-  record in the orders file cannot be reproduced.
-- **Residual over-matching.** After all of the above, the replay matches about 0.3–2.3% more
-  volume than the exchange printed for most securities, and up to 8.5% in the worst security
-  examined. The error is largest in heavily traded, low-priced securities with deep queues at a
-  large tick relative to price. Treat depth and fills as highly accurate but not exact.
+- **Iceberg continuation.** When an incoming order uses up an iceberg's visible tranche, the
+  exchange sometimes continues into the same iceberg's next tranche and sometimes moves on to
+  the next order. The replay always moves on. This changes who trades with whom for a few
+  percent of trades. It rarely changes depth or how much each order executes.
+
+Measured against the exchange's trade file over 33 million trades, the replay reproduces
+**94%** of trades exactly (same buy order, sell order, price and quantity), and **99.2%** of
+orders execute exactly the right quantity. See [Validation and Accuracy](Validation-and-Accuracy).
 
 ## Choosing the interval and depth
 
@@ -110,14 +101,12 @@ it scales with cores.
 
 ## Checking the replay yourself
 
-`examples/dump_fills` writes every fill the replay generates, with the incoming and resting
-order numbers. The trade file carries the order number on each side of every execution, so the
-two can be joined:
+`nsetick.replay_fills` returns every trade the replay generates, with the buy and sell order
+numbers, in the trade file's column names. `tools/verify_replay.py` compares them with the
+parsed trade file:
 
 ```bash
-cargo run --release -p nsetick-book --example dump_fills -- \
-    data/parquet/segment=cm/kind=orders/date=2022-01-25/symbol=TCS/part-000.parquet fills.csv
+python tools/verify_replay.py parsed/ --symbols TCS --dates 2022-01-25
 ```
 
-See [Validation and Accuracy](Validation-and-Accuracy) for how the published figures were
-produced.
+See [Validation and Accuracy](Validation-and-Accuracy#doing-the-check-yourself).

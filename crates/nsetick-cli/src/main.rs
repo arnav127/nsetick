@@ -510,8 +510,8 @@ fn cmd_describe(layout_id: &str, date: Option<String>) -> Result<()> {
         if v.verified { "" } else { "  [UNVERIFIED]" }
     );
     println!(
-        "{:<22} {:>6} {:>5}  {:<11} {}",
-        "field", "offset", "len", "type", "notes"
+        "{:<22} {:>6} {:>5}  {:<11} notes",
+        "field", "offset", "len", "type"
     );
     for f in &v.fields {
         let mut notes = Vec::new();

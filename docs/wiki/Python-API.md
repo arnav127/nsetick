@@ -84,6 +84,34 @@ Returns a report with `symbols`, `snapshots`, `events_applied`, `fills_generated
 [Order Book Reconstruction](Order-Book-Reconstruction) for the output columns and the matching
 rules.
 
+### `replay_fills(input, *, symbols=None)` → `pyarrow.Table`
+
+Replays parsed orders and returns **every trade the replay generates**, one row per trade,
+named like the exchange's trade file so the two can be joined:
+
+| Column | Meaning |
+|---|---|
+| `symbol` | Security |
+| `txn_time` | Time of the incoming order's event (IST, no timezone) |
+| `trade_price` | Price in paise: always the resting order's price |
+| `trade_quantity` | Shares |
+| `buy_order_number`, `sell_order_number` | The two orders, as in the trade file |
+| `aggressor` | `"B"` or `"S"`: the side of the incoming order |
+
+- `input`: a parsed-orders `date=...` directory, or one `part-*.parquet` file.
+- `symbols`: restrict to these symbols (all if omitted).
+
+The exchange stamps each of its trade records slightly after the order that caused it (one
+tick of about 15 µs per trade), so join on the order numbers, not on time.
+
+```python
+fills = nsetick.replay_fills("parsed/segment=cm/kind=orders/date=2022-01-25", symbols=["TCS"])
+fills.to_pandas().head()
+```
+
+See [Validation and Accuracy](Validation-and-Accuracy#doing-the-check-yourself) for a full
+comparison against the trade file.
+
 ## Inspecting layouts and files
 
 | Function | Returns |

@@ -558,12 +558,28 @@ fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// Every trade the order book replay generates, for comparison with the trade file.
+#[pyfunction]
+#[pyo3(signature = (input, symbols=None))]
+fn replay_fills(
+    py: Python<'_>,
+    input: PathBuf,
+    symbols: Option<Vec<String>>,
+) -> PyResult<PyArrowType<RecordBatch>> {
+    let symbols = symbols.unwrap_or_default();
+    let batch = py
+        .detach(|| nsetick_book::fills::replay_fills(&input, &symbols))
+        .map_err(to_py_err)?;
+    Ok(PyArrowType(batch))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BatchReader>()?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(run_spec, m)?)?;
     m.add_function(wrap_pyfunction!(build_books, m)?)?;
+    m.add_function(wrap_pyfunction!(replay_fills, m)?)?;
     m.add_function(wrap_pyfunction!(layouts, m)?)?;
     m.add_function(wrap_pyfunction!(describe, m)?)?;
     m.add_function(wrap_pyfunction!(probe, m)?)?;

@@ -70,7 +70,7 @@ impl ParquetReplayRequest {
 }
 
 /// Find the parquet files to replay, one unit of work each.
-fn discover(input: &Path, symbols: &[String]) -> Result<Vec<PathBuf>> {
+pub(crate) fn discover(input: &Path, symbols: &[String]) -> Result<Vec<PathBuf>> {
     if input.is_file() {
         return Ok(vec![input.to_path_buf()]);
     }
@@ -112,7 +112,7 @@ fn discover(input: &Path, symbols: &[String]) -> Result<Vec<PathBuf>> {
 }
 
 /// Read one parquet file, projecting only the columns a book needs.
-fn read_projected(path: &Path) -> Result<Vec<RecordBatch>> {
+pub(crate) fn read_projected(path: &Path) -> Result<Vec<RecordBatch>> {
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .with_context(|| format!("reading {}", path.display()))?;
@@ -219,7 +219,8 @@ pub fn run(req: &ParquetReplayRequest) -> Result<ReplayReport> {
     if req.levels == 0 {
         bail!("levels must be at least 1");
     }
-    if !(req.interval_secs > 0.0) {
+    // Written to reject NaN as well as zero and negative values.
+    if req.interval_secs.is_nan() || req.interval_secs <= 0.0 {
         bail!("interval_secs must be positive, got {}", req.interval_secs);
     }
 
@@ -295,13 +296,15 @@ pub fn run(req: &ParquetReplayRequest) -> Result<ReplayReport> {
     writer.into_inner().expect("writer lock").finish()?;
     let t = totals.into_inner().expect("totals lock");
 
-    let mut report = ReplayReport::default();
-    report.events_applied = t.0;
-    report.fills_generated = t.1;
-    report.snapshots = t.2;
-    report.replenishments = t.3;
-    report.symbols = t.4;
-    report.crossed_symbols = t.5;
+    let mut report = ReplayReport {
+        events_applied: t.0,
+        fills_generated: t.1,
+        snapshots: t.2,
+        replenishments: t.3,
+        symbols: t.4,
+        crossed_symbols: t.5,
+        ..Default::default()
+    };
     report.stats.rows_read = t.0;
     report.stats.rows_emitted = t.0;
     report.elapsed_secs = started.elapsed().as_secs_f64();

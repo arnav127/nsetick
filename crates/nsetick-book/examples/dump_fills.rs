@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     let mut out = BufWriter::new(File::create(&output)?);
     writeln!(
         out,
-        "symbol,timestamp,price,quantity,incoming_order,resting_order,from_hidden"
+        "symbol,timestamp,price,quantity,buy_order,sell_order,aggressor,incoming_order,resting_order"
     )?;
 
     // Same lookahead as the replay itself: announce each event on reading, apply it once the
@@ -49,8 +49,19 @@ fn main() -> Result<()> {
         for f in book.last_fills() {
             writeln!(
                 out,
-                "{sym},{},{},{},{},{},{}",
-                f.timestamp, f.price, f.quantity, f.incoming_order, f.resting_order, f.from_hidden
+                "{sym},{},{},{},{},{},{},{},{}",
+                f.timestamp,
+                f.price,
+                f.quantity,
+                f.buy_order(),
+                f.sell_order(),
+                if f.aggressor == nsetick_book::Side::Buy {
+                    "B"
+                } else {
+                    "S"
+                },
+                f.incoming_order,
+                f.resting_order
             )?;
         }
         Ok(())

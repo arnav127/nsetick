@@ -5,16 +5,26 @@
 //! reveal themselves. Deciding what to *do* with the resulting book is the caller's business.
 //!
 //! Several behaviours are specific to this market and easy to get wrong. Each rule below was
-//! checked against the exchange's own trade file, which records every execution: a replay
-//! that implements them should match the volume the trade file reports.
+//! checked against the exchange's own trade file, which names the buy and sell order of every
+//! execution: `fills::replay_fills` regenerates those records and `tools/verify_replay.py`
+//! scores them, trade by trade. The wiki page "Matching Engine" walks through all of it.
 //!
 //! * **Market orders** carry a limit price of zero. They take liquidity at any price and
 //!   never rest.
 //! * **Immediate-or-cancel** orders never rest; the unfilled part is discarded on entry. The
 //!   feed writes a cancel for it microseconds later, which the book recognises.
-//! * **Stop-loss** orders wait off the book until the last traded price reaches their
-//!   trigger (at or above it for a buy, at or below for a sell), then enter as ordinary
-//!   orders. Resting them at their limit on arrival creates liquidity that is not there.
+//! * **Stop-loss** orders are held off the book until the *feed* says they triggered: the
+//!   exchange writes a second entry record for the same order number at that moment. The
+//!   book does not simulate triggers from its own last traded price; doing so fires them
+//!   early and creates trades that never happened. A modify that clears the stop flag
+//!   converts the order to an ordinary one; a modify that sets it takes it off the book again.
+//! * **Self-trade prevention.** When an incoming order would match a resting order of the
+//!   same client, the exchange cancels the resting order instead. The feed shows only the
+//!   cancel, stamped one jiffy (1/65536 s) per step of the incoming order's sweep; the book
+//!   looks ahead for such a cancel in the matching slot and withdraws the order before it
+//!   can fill. See [`OrderBook::announce`].
+//! * **Trades per pair.** Consecutive fills between the same two orders at the same price are
+//!   one trade record, as in the exchange's file, even across iceberg tranches.
 //!
 //! And three concern how resting orders behave:
 //!
@@ -23,22 +33,15 @@
 //!   liquidity that is invisible to other participants.
 //! * **Replenishment.** When the visible tranche is exhausted, the next tranche appears and
 //!   **loses time priority**, going to the back of the queue at its price level.
-//! * **Modify is cancel-then-enter.** Activity type 4 does not amend in place; it removes the
-//!   order and re-enters it, so it loses queue position.
+//! * **Modify.** Activity type 4 carries the order's *remaining* quantity. A modify that only
+//!   reduces the quantity at the same price keeps the order's place in the queue; any other
+//!   modify (price change, increase, new disclosed quantity) is cancel-then-enter and goes to
+//!   the back.
 //!
 //! Prices are integer paise throughout. Nothing here converts to floating point: comparing
 //! prices is the core operation and integers make it exact.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-
-/// Does a trade at `ltp` trigger this stop-loss order? A buy stop fires when the price rises
-/// to its trigger, a sell stop when it falls to it.
-fn triggers(ev: &OrderEvent, ltp: i64) -> bool {
-    match ev.side {
-        Side::Buy => ltp >= ev.trigger_price,
-        Side::Sell => ltp <= ev.trigger_price,
-    }
-}
 
 /// Activity types in the NSE order feed.
 pub const ENTRY: u8 = 1;
@@ -81,82 +84,24 @@ pub struct OrderEvent {
     /// Market order. The feed records these with a limit price of zero; they take liquidity
     /// at any price and never rest.
     pub market: bool,
-    /// Stop-loss order: held off the book until the last traded price reaches
-    /// `trigger_price`, then entered as a limit (or market) order.
+    /// Stop-loss order: held off the book until the feed records its trigger (a second entry
+    /// record for the same order number), then entered as a limit (or market) order.
     pub stop_loss: bool,
     /// Trigger price in paise for a stop-loss order; zero otherwise.
     pub trigger_price: i64,
 }
 
 impl OrderEvent {
-    /// Would this order enter the book now, or wait for its trigger?
+    /// Does this event place the order in the waiting (untriggered) stop-loss state?
     fn is_pending_stop(&self) -> bool {
         self.stop_loss && self.trigger_price > 0
     }
-}
 
-/// A stop-loss order waiting for its trigger. Keyed so the orders a price move triggers are a
-/// contiguous range: buy stops fire when the last trade reaches or exceeds the trigger, sell
-/// stops when it reaches or falls below it.
-#[derive(Debug, Default)]
-struct PendingStops {
-    buys: BTreeMap<(i64, u64), OrderEvent>,
-    sells: BTreeMap<(i64, u64), OrderEvent>,
-    /// order number -> (side, trigger, arrival sequence), for cancel and modify.
-    index: HashMap<u64, (Side, i64, u64)>,
-    next_seq: u64,
-}
-
-impl PendingStops {
-    fn hold(&mut self, ev: OrderEvent) {
-        self.next_seq += 1;
-        let key = (ev.trigger_price, self.next_seq);
-        self.index
-            .insert(ev.order_number, (ev.side, ev.trigger_price, self.next_seq));
-        match ev.side {
-            Side::Buy => self.buys.insert(key, ev),
-            Side::Sell => self.sells.insert(key, ev),
-        };
-    }
-
-    fn take(&mut self, order_number: u64) -> Option<OrderEvent> {
-        let (side, trigger, seq) = self.index.remove(&order_number)?;
-        match side {
-            Side::Buy => self.buys.remove(&(trigger, seq)),
-            Side::Sell => self.sells.remove(&(trigger, seq)),
-        }
-    }
-
-    /// Remove and return every stop the last trade price triggers, in arrival order.
-    fn triggered_by(&mut self, ltp: i64) -> Vec<OrderEvent> {
-        let mut keys: Vec<(u64, Side, (i64, u64))> = Vec::new();
-        keys.extend(
-            self.buys
-                .range(..=(ltp, u64::MAX))
-                .map(|(k, _)| (k.1, Side::Buy, *k)),
-        );
-        keys.extend(
-            self.sells
-                .range((ltp, 0)..)
-                .map(|(k, _)| (k.1, Side::Sell, *k)),
-        );
-        keys.sort_unstable_by_key(|k| k.0);
-        let mut out = Vec::with_capacity(keys.len());
-        for (_, side, key) in keys {
-            let ev = match side {
-                Side::Buy => self.buys.remove(&key),
-                Side::Sell => self.sells.remove(&key),
-            };
-            if let Some(ev) = ev {
-                self.index.remove(&ev.order_number);
-                out.push(ev);
-            }
-        }
-        out
-    }
-
-    fn len(&self) -> usize {
-        self.index.len()
+    /// Could this order and `other` belong to the same client? Self-trade prevention needs
+    /// the same client, and the feed's participant category and algo flag are the only parts
+    /// of a client's identity it records.
+    fn same_client_possible(&self, algo_indicator: u8, client_identity: u8) -> bool {
+        self.algo_indicator == algo_indicator && self.client_identity == client_identity
     }
 }
 
@@ -177,6 +122,8 @@ struct BookOrder {
     /// Visible plus hidden.
     remaining: i64,
     is_iceberg: bool,
+    /// The visible quantity is a tranche revealed after entry: it was hidden when placed.
+    revealed: bool,
     algo_indicator: u8,
     client_identity: u8,
 }
@@ -215,10 +162,13 @@ pub struct BookStats {
     /// Cancels the feed writes for an IOC or market remainder the book already discarded.
     /// Counted here rather than as unknown references, which would bury real problems.
     pub remainder_cancels: u64,
-    /// Stop-loss orders held off the book awaiting their trigger.
+    /// Stop-loss orders placed in the waiting state, on entry or by a modify re-arming them.
     pub stops_held: u64,
-    /// Stop-loss orders entered because their trigger was reached, on arrival or later.
+    /// Stop-loss orders the feed reported as triggered (a repeated entry record) or a modify
+    /// converted to an ordinary order, and which therefore entered the book.
     pub stops_triggered: u64,
+    /// Modifies that only reduced quantity at an unchanged price, keeping queue priority.
+    pub amended_in_place: u64,
     /// Resting orders withdrawn instead of matched because the exchange cancelled them as
     /// the incoming order arrived - self-trade prevention. Requires announced events.
     pub self_trade_preventions: u64,
@@ -242,9 +192,30 @@ pub struct Fill {
     pub quantity: i64,
     pub resting_order: u64,
     pub incoming_order: u64,
-    /// True when the resting side was a hidden tranche rather than displayed quantity.
+    /// True when some of the quantity came from a tranche that was hidden when the resting
+    /// order was placed and revealed later, rather than from its original displayed quantity.
     pub from_hidden: bool,
     pub timestamp: i64,
+    /// Side of the incoming (aggressing) order.
+    pub aggressor: Side,
+}
+
+impl Fill {
+    /// The buying order of the pair, as the trade file records it.
+    pub fn buy_order(&self) -> u64 {
+        match self.aggressor {
+            Side::Buy => self.incoming_order,
+            Side::Sell => self.resting_order,
+        }
+    }
+
+    /// The selling order of the pair.
+    pub fn sell_order(&self) -> u64 {
+        match self.aggressor {
+            Side::Buy => self.resting_order,
+            Side::Sell => self.incoming_order,
+        }
+    }
 }
 
 pub struct OrderBook {
@@ -260,9 +231,9 @@ pub struct OrderBook {
     next_seq: u64,
     /// Fills from the most recent event, reused to avoid reallocating per event.
     fills: Vec<Fill>,
-    /// Stop-loss orders not yet triggered.
-    stops: PendingStops,
-    /// Price of the most recent fill the book generated; drives stop-loss triggers.
+    /// Stop-loss orders waiting for their trigger, by order number.
+    stops: HashMap<u64, OrderEvent>,
+    /// Price of the most recent fill the book generated.
     last_trade_price: Option<i64>,
     /// IOC and market orders whose unfilled remainder was discarded on entry. The feed
     /// follows each with a cancel a few microseconds later; this lets that cancel be
@@ -275,18 +246,26 @@ pub struct OrderBook {
     /// Resting orders withdrawn at match time because the exchange cancelled them; their own
     /// cancel arrives later and is recognised rather than counted as unknown.
     preempted: HashSet<u64>,
+    /// Messages the current incoming order's match has produced so far: trades plus
+    /// self-trade cancels. Locates each step of the sweep in the feed's clock.
+    sweep_steps: usize,
 }
 
-/// How far ahead of a match to look for the exchange cancelling the resting order.
+/// One tick of the feed's clock: 1/65536 of a second, in microseconds.
+///
+/// The exchange stamps each message a matching event produces - every trade, and every order
+/// it cancels along the way - one tick after the previous one. A sweep through 300 resting
+/// orders therefore spans 300 ticks, about 4.6 ms, in the feed.
+pub const JIFFY_MICROS: f64 = 1_000_000.0 / 65_536.0;
+
+/// How far ahead of the event being applied the replay reads, so that cancels the exchange
+/// issued while processing it are already known. Covers sweeps of several thousand steps.
 ///
 /// NSE prevents a client trading with itself by cancelling the *resting* order when an
-/// incoming order from the same client would match it. The feed carries no client
-/// identifier, so this cannot be seen directly; what the feed shows is the resting order's
-/// cancel, timestamped a few hundred microseconds after the incoming order that caused it.
-/// Measured against the trade file, fills against resting orders cancelled within this window
-/// accounted for all of the replay's excess volume in the worst-affected security (30.7M of
-/// 30.1M excess shares in YESBANK on 25 January 2022).
-pub const SELF_TRADE_WINDOW_MICROS: i64 = 1_000;
+/// incoming order from the same client reaches it. The feed carries no client identifier; it
+/// shows the resting order's cancel, stamped at the step of the sweep where the incoming
+/// order reached it. The lookahead lets the book see that cancel before it matches.
+pub const SELF_TRADE_WINDOW_MICROS: i64 = 100_000;
 
 impl OrderBook {
     pub fn new(symbol: impl Into<String>) -> Self {
@@ -300,11 +279,12 @@ impl OrderBook {
             active_icebergs: 0,
             next_seq: 0,
             fills: Vec::new(),
-            stops: PendingStops::default(),
+            stops: HashMap::new(),
             last_trade_price: None,
             discarded_remainders: HashSet::new(),
             scheduled_cancels: HashMap::new(),
             preempted: HashSet::new(),
+            sweep_steps: 0,
         }
     }
 
@@ -323,11 +303,22 @@ impl OrderBook {
         }
     }
 
-    /// Is a cancel for this resting order due within the window after `now`?
-    fn cancel_imminent(&self, order_number: u64, now: i64) -> bool {
+    /// Did the exchange cancel this resting order at `step` of the sweep that began at `now`?
+    ///
+    /// Step *k* of a matching event is stamped *k*+1 ticks after the incoming order. A resting
+    /// order cancelled at the step where the sweep reached it is a self-trade prevention. The
+    /// tolerance is two ticks either side plus rounding: timestamps arrive truncated to whole
+    /// microseconds. A client cancelling its own remainder after being filled does so hundreds
+    /// of microseconds later and cannot satisfy this, which a fixed time window could not
+    /// distinguish.
+    fn cancelled_at_step(&self, order_number: u64, now: i64, step: usize) -> bool {
+        let expected = (step as f64 + 1.0) * JIFFY_MICROS;
+        let tolerance = 2.0 * JIFFY_MICROS + 2.0;
         self.scheduled_cancels.get(&order_number).is_some_and(|ts| {
-            ts.iter()
-                .any(|&t| t >= now && t - now <= SELF_TRADE_WINDOW_MICROS)
+            ts.iter().any(|&t| {
+                let offset = (t - now) as f64;
+                offset > 0.0 && (offset - expected).abs() <= tolerance
+            })
         })
     }
 
@@ -373,7 +364,18 @@ impl OrderBook {
         match ev.activity_type {
             ENTRY => {
                 self.stats.entries += 1;
-                self.enter_or_hold(ev);
+                if self.stops.remove(&ev.order_number).is_some() {
+                    // A second entry record for a waiting stop-loss order is the exchange
+                    // reporting its trigger. It enters the book now, with priority from now.
+                    self.stats.stops_triggered += 1;
+                    let mut live = *ev;
+                    live.stop_loss = false;
+                    self.enter(&live);
+                } else if ev.is_pending_stop() {
+                    self.hold_stop(ev);
+                } else {
+                    self.enter(ev);
+                }
             }
             CANCEL => {
                 self.stats.cancels += 1;
@@ -385,7 +387,7 @@ impl OrderBook {
                 }
                 if self.preempted.remove(&ev.order_number) {
                     // Withdrawn at match time as a self-trade prevention; this is its cancel.
-                } else if self.stops.take(ev.order_number).is_some() {
+                } else if self.stops.remove(&ev.order_number).is_some() {
                     // A stop cancelled before it triggered: it was never on the book.
                 } else if self.remove(ev.order_number).is_some() {
                 } else if self.discarded_remainders.remove(&ev.order_number) {
@@ -394,79 +396,98 @@ impl OrderBook {
                     self.stats.unknown_order_refs += 1;
                 }
             }
-            // A modify is a cancel followed by a fresh entry: the order loses queue position.
-            // The modify carries the order's *remaining* quantity, not its original total -
-            // measured against the trade file, fills after a modify never exceed it while
-            // lifetime fills exceed it for 81% of partly filled orders - so re-entering it as
-            // the resting quantity is correct.
             MODIFY => {
                 self.stats.modifies += 1;
-                if self.stops.take(ev.order_number).is_some() {
-                    // Still untriggered: re-evaluate against its (possibly new) trigger.
-                    self.enter_or_hold(ev);
-                } else if self.remove(ev.order_number).is_some() {
-                    // Already on the book, so any stop has fired; it re-enters as a plain order.
-                    let mut live = *ev;
-                    live.stop_loss = false;
-                    self.enter(&live);
-                } else {
-                    // A modify naming a discarded market remainder is the exchange converting
-                    // it to a limit order, which is legitimate; anything else is unknown.
-                    if !self.discarded_remainders.remove(&ev.order_number) {
-                        self.stats.unknown_order_refs += 1;
+                let was_waiting = self.stops.remove(&ev.order_number).is_some();
+                if ev.is_pending_stop() {
+                    // A modify that sets the stop-loss flag leaves - or puts - the order in the
+                    // waiting state, off the book, even if it had already triggered.
+                    if !was_waiting && self.remove(ev.order_number).is_none() {
+                        self.note_unknown_modify(ev.order_number);
                     }
-                    self.enter_or_hold(ev);
+                    self.hold_stop(ev);
+                } else if was_waiting {
+                    // A modify clearing the flag converts a waiting stop into an ordinary order.
+                    self.stats.stops_triggered += 1;
+                    self.enter(ev);
+                } else if self.amend_in_place(ev) {
+                    // Quantity reduced at the same price: keeps its place in the queue.
+                } else if self.remove(ev.order_number).is_some() {
+                    // Anything else is cancel-then-enter: the order goes to the back.
+                    self.enter(ev);
+                } else {
+                    self.note_unknown_modify(ev.order_number);
+                    self.enter(ev);
                 }
             }
             _ => self.stats.events_rejected += 1,
         }
-        self.release_triggered_stops();
+        if let Some(f) = self.fills.last() {
+            self.last_trade_price = Some(f.price);
+        }
         self.fills.len()
     }
 
-    /// Enter the order now, or hold it if it is a stop-loss whose trigger has not been reached.
-    fn enter_or_hold(&mut self, ev: &OrderEvent) {
-        if ev.is_pending_stop() {
-            let fired = self.last_trade_price.is_some_and(|ltp| triggers(ev, ltp));
-            if !fired {
-                self.stats.stops_held += 1;
-                self.stops.hold(*ev);
-                return;
-            }
-            self.stats.stops_triggered += 1;
-            let mut live = *ev;
-            live.stop_loss = false;
-            self.enter(&live);
-            return;
-        }
-        self.enter(ev);
+    fn hold_stop(&mut self, ev: &OrderEvent) {
+        self.stats.stops_held += 1;
+        self.stops.insert(ev.order_number, *ev);
     }
 
-    /// Release every held stop the latest trade has triggered. Each release can itself trade
-    /// and move the price, so repeat until nothing more fires.
-    fn release_triggered_stops(&mut self) {
-        loop {
-            let Some(ltp) = self.fills.last().map(|f| f.price) else {
-                return;
-            };
-            self.last_trade_price = Some(ltp);
-            if self.stops.len() == 0 {
-                return;
-            }
-            let fired = self.stops.triggered_by(ltp);
-            if fired.is_empty() {
-                return;
-            }
-            let before = self.fills.len();
-            for mut ev in fired {
-                self.stats.stops_triggered += 1;
-                ev.stop_loss = false;
-                self.enter(&ev);
-            }
-            if self.fills.len() == before {
-                return;
-            }
+    /// A modify naming an order the book does not hold. After a discarded market remainder
+    /// it is the exchange converting that remainder to a limit order, which is legitimate.
+    fn note_unknown_modify(&mut self, order_number: u64) {
+        if !self.discarded_remainders.remove(&order_number) {
+            self.stats.unknown_order_refs += 1;
         }
+    }
+
+    /// Apply a modify that only reduces a resting order's quantity at an unchanged price and
+    /// display size, keeping its place in the queue. Returns false for anything else - a price
+    /// change, an increase, a change of disclosed quantity - which is cancel-then-enter.
+    fn amend_in_place(&mut self, ev: &OrderEvent) -> bool {
+        let Some(o) = self.orders.get(&ev.order_number) else {
+            return false;
+        };
+        let same_display = if o.is_iceberg {
+            ev.volume_disclosed == o.tranche
+        } else {
+            ev.volume_disclosed <= 0 || ev.volume_disclosed >= ev.volume_original
+        };
+        let reduce_only = o.side == ev.side
+            && o.price == ev.price
+            && !ev.market
+            && ev.volume_original > 0
+            && ev.volume_original <= o.remaining
+            && same_display;
+        if !reduce_only {
+            return false;
+        }
+
+        let (side, price) = (o.side, o.price);
+        let new_remaining = ev.volume_original;
+        let new_visible = o.visible.min(new_remaining);
+        let new_hidden = new_remaining - new_visible;
+        let (d_visible, d_hidden) = (o.visible - new_visible, o.hidden - new_hidden);
+        let had_hidden = o.hidden > 0;
+
+        let o = self
+            .orders
+            .get_mut(&ev.order_number)
+            .expect("checked above");
+        o.remaining = new_remaining;
+        o.visible = new_visible;
+        o.hidden = new_hidden;
+
+        self.resting_hidden -= d_hidden;
+        if had_hidden && new_hidden == 0 {
+            self.active_icebergs -= 1;
+        }
+        if let Some(level) = self.level_mut(side, price) {
+            level.visible -= d_visible;
+            level.hidden -= d_hidden;
+        }
+        self.stats.amended_in_place += 1;
+        true
     }
 
     fn enter(&mut self, ev: &OrderEvent) {
@@ -534,6 +555,7 @@ impl OrderBook {
             hidden: remaining - rest_visible,
             remaining,
             is_iceberg,
+            revealed: false,
             algo_indicator: ev.algo_indicator,
             client_identity: ev.client_identity,
         };
@@ -556,6 +578,7 @@ impl OrderBook {
     /// Match an incoming order against the resting book. Returns the quantity filled.
     fn match_incoming(&mut self, ev: &OrderEvent, mut remaining: i64) -> i64 {
         let mut filled = 0i64;
+        self.sweep_steps = 0;
 
         while remaining > 0 {
             // Best opposing price, if it is still crossed with the incoming limit.
@@ -610,10 +633,15 @@ impl OrderBook {
 
             // The exchange is about to cancel this resting order: self-trade prevention. It
             // must not trade; withdraw it now, as the matching engine did.
-            if self.cancel_imminent(id, ev.timestamp) {
+            let could_be_same_client = self
+                .orders
+                .get(&id)
+                .is_some_and(|o| ev.same_client_possible(o.algo_indicator, o.client_identity));
+            if could_be_same_client && self.cancelled_at_step(id, ev.timestamp, self.sweep_steps) {
                 self.remove(id);
                 self.preempted.insert(id);
                 self.stats.self_trade_preventions += 1;
+                self.sweep_steps += 1;
                 match self.level_mut(opposite, price) {
                     Some(lvl) => {
                         lvl.queue.pop_front();
@@ -647,20 +675,40 @@ impl OrderBook {
             let exhausted = order.remaining <= 0;
             let reveal_next = order.visible <= 0 && order.is_iceberg && !exhausted;
             let rest_price = order.price;
+            let from_hidden = order.revealed;
 
             self.level_mut(opposite, price)
                 .expect("level exists")
                 .visible -= fill;
             taken += fill;
-            self.fills.push(Fill {
-                price: rest_price,
-                quantity: fill,
-                resting_order: id,
-                incoming_order: ev.order_number,
-                from_hidden: false,
-                timestamp: ev.timestamp,
-            });
-            self.stats.trades_generated += 1;
+            // Consecutive fills of the same pair are one trade. When an incoming order works
+            // through a disclosed-quantity order that is alone at its price, each revealed
+            // tranche comes straight back to the front, and the exchange prints the whole
+            // execution as a single trade rather than one per tranche. If anything else traded
+            // in between, the fills are genuinely separate trades and stay separate.
+            match self.fills.last_mut() {
+                Some(last)
+                    if last.resting_order == id
+                        && last.incoming_order == ev.order_number
+                        && last.price == rest_price =>
+                {
+                    last.quantity += fill;
+                    last.from_hidden |= from_hidden;
+                }
+                _ => {
+                    self.fills.push(Fill {
+                        price: rest_price,
+                        quantity: fill,
+                        resting_order: id,
+                        incoming_order: ev.order_number,
+                        from_hidden,
+                        timestamp: ev.timestamp,
+                        aggressor: ev.side,
+                    });
+                    self.stats.trades_generated += 1;
+                    self.sweep_steps += 1;
+                }
+            }
 
             if exhausted {
                 self.level_mut(opposite, price).unwrap().queue.pop_front();
@@ -702,6 +750,7 @@ impl OrderBook {
         }
         order.visible = reveal;
         order.hidden = order.remaining - reveal;
+        order.revealed = true;
         let still_hidden = order.hidden > 0;
         if let Some(lvl) = self.level_mut(side, price) {
             lvl.visible += reveal;
@@ -964,45 +1013,59 @@ mod tests {
     }
 
     #[test]
-    fn stop_loss_waits_for_its_trigger() {
+    fn stop_loss_waits_for_the_feeds_trigger_record() {
         let mut b = OrderBook::new("TEST");
         b.apply(&limit(1, Side::Sell, 101_00, 10));
-        // Buy stop, trigger 100.50, limit 101.00. It must not trade on arrival.
+        // Buy stop, trigger 100.50, limit 101.00. Marketable on paper, but it must not trade:
+        // it waits off the book until the exchange reports the trigger.
         b.apply(&stop(2, Side::Buy, 101_00, 100_50, 10));
         assert_eq!(b.stats().volume_matched, 0);
         assert_eq!(b.pending_stops(), 1);
-        assert_eq!(b.best_bid(), None, "untriggered stop is not on the book");
+        assert_eq!(b.best_bid(), None, "a waiting stop is not on the book");
 
-        // A trade below the trigger leaves it held.
-        b.apply(&limit(3, Side::Sell, 100_40, 1));
-        b.apply(&limit(4, Side::Buy, 100_40, 1));
-        assert_eq!(b.last_trade_price(), Some(100_40));
+        // Trades through the trigger price do not release it on their own: the replay does
+        // not guess triggers, it follows the feed.
+        b.apply(&limit(3, Side::Sell, 100_60, 1));
+        b.apply(&limit(4, Side::Buy, 100_60, 1));
         assert_eq!(b.pending_stops(), 1);
 
-        // A trade at the trigger releases it, and it trades against the resting 101.00 offer.
-        b.apply(&limit(5, Side::Sell, 100_50, 1));
-        b.apply(&limit(6, Side::Buy, 100_50, 1));
+        // The feed reports the trigger as a second entry record for the same order number.
+        assert_eq!(b.apply(&stop(2, Side::Buy, 101_00, 100_50, 10)), 1);
         assert_eq!(b.pending_stops(), 0);
         assert_eq!(b.stats().stops_triggered, 1);
-        assert_eq!(b.best_ask(), None, "released stop lifted the 101.00 offer");
+        assert_eq!(
+            b.best_ask(),
+            None,
+            "the triggered stop lifted the 101.00 offer"
+        );
     }
 
     #[test]
-    fn sell_stop_triggers_on_a_fall() {
+    fn a_modify_clearing_the_stop_flag_converts_it_to_an_ordinary_order() {
         let mut b = OrderBook::new("TEST");
         b.apply(&limit(1, Side::Buy, 99_00, 10));
-        b.apply(&stop(2, Side::Sell, 99_00, 99_50, 10));
-        b.apply(&limit(3, Side::Buy, 99_60, 1));
-        b.apply(&limit(4, Side::Sell, 99_60, 1));
+        b.apply(&stop(2, Side::Sell, 99_00, 98_50, 10));
+        assert_eq!(b.pending_stops(), 1);
+        let mut plain = limit(2, Side::Sell, 99_00, 10);
+        plain.activity_type = MODIFY;
         assert_eq!(
-            b.pending_stops(),
+            b.apply(&plain),
             1,
-            "a trade above a sell trigger does not fire it"
+            "converted, it trades against the 99.00 bid"
         );
-        b.apply(&limit(5, Side::Buy, 99_50, 1));
-        b.apply(&limit(6, Side::Sell, 99_50, 1));
         assert_eq!(b.pending_stops(), 0);
-        assert_eq!(b.best_bid(), None, "released sell stop hit the 99.00 bid");
+    }
+
+    #[test]
+    fn a_modify_setting_the_stop_flag_takes_a_live_order_off_the_book() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&limit(1, Side::Buy, 99_00, 10));
+        let mut rearm = stop(1, Side::Buy, 99_00, 99_50, 10);
+        rearm.activity_type = MODIFY;
+        b.apply(&rearm);
+        assert_eq!(b.best_bid(), None);
+        assert_eq!(b.pending_stops(), 1);
+        assert_eq!(b.stats().unknown_order_refs, 0);
     }
 
     #[test]
@@ -1034,8 +1097,9 @@ mod tests {
         other.timestamp = 1_001;
         let mut incoming = limit(3, Side::Sell, 100_00, 10);
         incoming.timestamp = 5_000;
+        // Stamped one feed tick after the incoming order: the first step of its sweep.
         let mut its_cancel = cancel(1, Side::Buy);
-        its_cancel.timestamp = 5_150;
+        its_cancel.timestamp = 5_015;
 
         for e in [&resting, &other, &incoming, &its_cancel] {
             b.announce(e);
@@ -1060,8 +1124,10 @@ mod tests {
         resting.timestamp = 1_000;
         let mut incoming = limit(2, Side::Sell, 100_00, 4);
         incoming.timestamp = 5_000;
+        // A client cancelling its remainder after being filled: 336 microseconds later, well
+        // after the sweep, as in the case that exposed the fixed-window rule.
         let mut later = cancel(1, Side::Buy);
-        later.timestamp = 5_000 + SELF_TRADE_WINDOW_MICROS + 1;
+        later.timestamp = 5_336;
         for e in [&resting, &incoming, &later] {
             b.announce(e);
         }
@@ -1251,6 +1317,26 @@ mod tests {
         assert_eq!(b.active_icebergs(), 0);
         assert_eq!(b.stats().volume_matched, 500);
         assert_eq!(b.total_visible(Side::Buy), 0, "incoming order fully filled");
+        // Alone at its price, each tranche comes straight back to the front: one trade.
+        assert_eq!(b.last_fills().len(), 1);
+        assert_eq!(b.last_fills()[0].quantity, 500);
+        assert!(b.last_fills()[0].from_hidden);
+    }
+
+    #[test]
+    fn from_hidden_marks_only_revealed_tranches() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&ev(ENTRY, 1, Side::Sell, 100_00, 100, 300));
+        b.apply(&limit(2, Side::Buy, 100_00, 100));
+        assert!(
+            !b.last_fills()[0].from_hidden,
+            "the first tranche was displayed"
+        );
+        b.apply(&limit(3, Side::Buy, 100_00, 50));
+        assert!(
+            b.last_fills()[0].from_hidden,
+            "the second tranche was hidden at entry"
+        );
     }
 
     #[test]
@@ -1274,15 +1360,46 @@ mod tests {
     }
 
     #[test]
-    fn modify_loses_queue_position() {
+    fn a_price_change_loses_queue_position() {
+        let mut b = OrderBook::new("TEST");
+        b.apply(&limit(1, Side::Sell, 100_00, 10));
+        b.apply(&limit(2, Side::Sell, 100_05, 10));
+        b.apply(&limit(3, Side::Sell, 100_00, 10));
+        // Order 2 reprices to 100.00: it is removed and re-entered, behind order 3.
+        b.apply(&ev(MODIFY, 2, Side::Sell, 100_00, 0, 10));
+        b.apply(&limit(4, Side::Buy, 100_00, 30));
+        let order: Vec<u64> = b.last_fills().iter().map(|f| f.resting_order).collect();
+        assert_eq!(order, vec![1, 3, 2]);
+        assert_eq!(b.stats().amended_in_place, 0);
+    }
+
+    #[test]
+    fn a_quantity_increase_loses_queue_position() {
         let mut b = OrderBook::new("TEST");
         b.apply(&limit(1, Side::Sell, 100_00, 10));
         b.apply(&limit(2, Side::Sell, 100_00, 10));
-        // Modify order 1: it is removed and re-entered, so it now sits behind order 2.
-        b.apply(&ev(MODIFY, 1, Side::Sell, 100_00, 0, 10));
+        b.apply(&ev(MODIFY, 1, Side::Sell, 100_00, 0, 15));
         b.apply(&limit(3, Side::Buy, 100_00, 10));
         assert_eq!(b.last_fills()[0].resting_order, 2);
-        assert_eq!(b.stats().modifies, 1);
+    }
+
+    #[test]
+    fn a_quantity_reduction_keeps_queue_position() {
+        // Confirmed against the trade file: keeping priority on a same-price reduction
+        // reproduces more of the exchange's actual trades on every security tested.
+        let mut b = OrderBook::new("TEST");
+        b.apply(&limit(1, Side::Sell, 100_00, 10));
+        b.apply(&limit(2, Side::Sell, 100_00, 10));
+        b.apply(&ev(MODIFY, 1, Side::Sell, 100_00, 0, 4));
+        assert_eq!(b.total_visible(Side::Sell), 14);
+        b.apply(&limit(3, Side::Buy, 100_00, 6));
+        let fills: Vec<(u64, i64)> = b
+            .last_fills()
+            .iter()
+            .map(|f| (f.resting_order, f.quantity))
+            .collect();
+        assert_eq!(fills, vec![(1, 4), (2, 2)]);
+        assert_eq!(b.stats().amended_in_place, 1);
     }
 
     #[test]

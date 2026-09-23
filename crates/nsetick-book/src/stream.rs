@@ -10,7 +10,7 @@
 
 use std::collections::VecDeque;
 
-use crate::book::{BookStats, OrderBook, OrderEvent, SELF_TRADE_WINDOW_MICROS};
+use crate::book::{BookStats, Fill, OrderBook, OrderEvent, SELF_TRADE_WINDOW_MICROS};
 use crate::snapshot::{IntervalCounts, SnapshotBuilder};
 
 /// Totals from driving a book, summed by the caller across symbols.
@@ -38,6 +38,8 @@ pub struct SymbolReplay {
     /// Events read and announced but not yet applied.
     pending: VecDeque<OrderEvent>,
     lookahead_micros: i64,
+    /// Every fill the book generates, when recording is on.
+    recorded: Option<Vec<Fill>>,
 }
 
 impl SymbolReplay {
@@ -54,7 +56,22 @@ impl SymbolReplay {
             last_stats: BookStats::default(),
             pending: VecDeque::new(),
             lookahead_micros: lookahead_micros.max(0),
+            recorded: None,
         }
+    }
+
+    /// Keep every fill the replay generates, for [`SymbolReplay::take_fills`].
+    pub fn record_fills(mut self) -> Self {
+        self.recorded = Some(Vec::new());
+        self
+    }
+
+    /// The fills recorded since the last call.
+    pub fn take_fills(&mut self) -> Vec<Fill> {
+        self.recorded
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
     }
 
     /// Read one event. Applies every buffered event the stream has now moved far enough past.
@@ -107,6 +124,9 @@ impl SymbolReplay {
             p.snapshots += 1;
         }
         p.fills = self.book.apply(ev) as u64;
+        if let Some(sink) = self.recorded.as_mut() {
+            sink.extend_from_slice(self.book.last_fills());
+        }
         p
     }
 }
@@ -141,7 +161,7 @@ mod tests {
         let events = [
             event(ENTRY, 1, Side::Buy, 100_00, 10, 1_000),
             event(ENTRY, 2, Side::Sell, 100_00, 10, 5_000),
-            event(CANCEL, 1, Side::Buy, 0, 0, 5_150),
+            event(CANCEL, 1, Side::Buy, 0, 0, 5_015),
         ];
         let mut p = Progress::default();
         for e in &events {
@@ -168,7 +188,7 @@ mod tests {
         for e in [
             event(ENTRY, 1, Side::Buy, 100_00, 10, 1_000),
             event(ENTRY, 2, Side::Sell, 100_00, 10, 5_000),
-            event(CANCEL, 1, Side::Buy, 0, 0, 5_150),
+            event(CANCEL, 1, Side::Buy, 0, 0, 5_015),
         ] {
             p += r.feed(&e, &mut sb, 1_000_000);
         }

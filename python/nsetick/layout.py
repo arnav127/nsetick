@@ -7,7 +7,12 @@ nsetick is permitted to hardcode a byte offset.
 
 from __future__ import annotations
 
-import tomllib
+import sys
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # tomllib joined the standard library in 3.11; tomli is its backport.
+    import tomli as tomllib
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
