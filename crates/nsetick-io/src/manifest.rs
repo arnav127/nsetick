@@ -57,18 +57,16 @@ impl Manifest {
     /// Manifests are named per layout and date, so parsing orders and trades for the same
     /// session into one root does not have them overwrite each other.
     pub fn write(&self, root: &Path, layout_id: &str, date: NaiveDate) -> Result<PathBuf> {
-        std::fs::create_dir_all(root)
-            .with_context(|| format!("creating {}", root.display()))?;
+        std::fs::create_dir_all(root).with_context(|| format!("creating {}", root.display()))?;
         let path = root.join(format!("_manifest.{layout_id}.{date}.json"));
         let json = serde_json::to_string_pretty(self).context("serialising manifest")?;
-        std::fs::write(&path, json)
-            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::write(&path, json).with_context(|| format!("writing {}", path.display()))?;
         Ok(path)
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
 

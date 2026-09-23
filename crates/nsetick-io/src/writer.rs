@@ -131,8 +131,7 @@ pub fn split_by_partition(
             .context("gathering partition rows")?;
         out.push((
             key.to_string(),
-            RecordBatch::try_new(Arc::clone(&schema), cols)
-                .context("building partition batch")?,
+            RecordBatch::try_new(Arc::clone(&schema), cols).context("building partition batch")?,
         ));
     }
     Ok(out)
@@ -192,7 +191,10 @@ impl PartitionedWriter {
                     )
                 })?;
                 // Only a string column can name a directory.
-                if !matches!(schema.field(idx).data_type(), arrow::datatypes::DataType::Utf8) {
+                if !matches!(
+                    schema.field(idx).data_type(),
+                    arrow::datatypes::DataType::Utf8
+                ) {
                     bail!(
                         "cannot partition by {name:?}: it is {:?}, not a string",
                         schema.field(idx).data_type()
@@ -250,9 +252,7 @@ impl PartitionedWriter {
                 File::create(&path).with_context(|| format!("creating {}", path.display()))?;
             let writer =
                 ArrowWriter::try_new(file, Arc::clone(&self.schema), Some(self.props.clone()))
-                    .with_context(|| {
-                        format!("opening parquet writer for {}", path.display())
-                    })?;
+                    .with_context(|| format!("opening parquet writer for {}", path.display()))?;
             self.parts.insert(
                 key.to_string(),
                 Partition {
@@ -521,7 +521,9 @@ mod tests {
             .unwrap();
         w.finish().unwrap();
 
-        assert!(root.join("date=2022-01-27/symbol=M&M/part-000.parquet").exists());
+        assert!(root
+            .join("date=2022-01-27/symbol=M&M/part-000.parquet")
+            .exists());
         assert!(root
             .join("date=2022-01-27/symbol=COX&KINGS/part-000.parquet")
             .exists());
@@ -594,7 +596,11 @@ mod tests {
 
     #[test]
     fn partitioning_by_a_field_that_was_projected_away_fails_clearly() {
-        let narrow = Arc::new(Schema::new(vec![Field::new("price", DataType::Int64, true)]));
+        let narrow = Arc::new(Schema::new(vec![Field::new(
+            "price",
+            DataType::Int64,
+            true,
+        )]));
         // PartitionedWriter holds an ArrowWriter and is not Debug, so unwrap_err is out.
         let err = match PartitionedWriter::new(
             tmp("nsetick_w_missing"),
@@ -610,10 +616,7 @@ mod tests {
 
     #[test]
     fn split_preserves_row_order_within_each_group() {
-        let b = batch(
-            &["A", "B", "A", "C", "B", "A"],
-            &[1, 10, 2, 100, 20, 3],
-        );
+        let b = batch(&["A", "B", "A", "C", "B", "A"], &[1, 10, 2, 100, 20, 3]);
         let mut got: Vec<(String, Vec<i64>)> = split_by_partition(&b, 0)
             .unwrap()
             .into_iter()

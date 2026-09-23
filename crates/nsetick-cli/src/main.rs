@@ -14,8 +14,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use nsetick_core::decode::{DecodeOptions, Decoder, Stats};
 use nsetick_core::{filter, layout};
 use nsetick_io::pipeline::{self, ParseRequest};
-use nsetick_io::{infer_date, infer_layout, spec};
 use nsetick_io::writer::WriterOptions;
+use nsetick_io::{infer_date, infer_layout, spec};
 
 #[derive(Parser)]
 #[command(
@@ -247,8 +247,7 @@ fn cmd_book(args: BookArgs) -> Result<()> {
                 )
             })?,
         };
-        let mut req =
-            nsetick_book::ParquetReplayRequest::new(&args.input, &args.out, date);
+        let mut req = nsetick_book::ParquetReplayRequest::new(&args.input, &args.out, date);
         req.interval_secs = args.interval;
         req.levels = args.levels;
         req.threads = args.threads;
@@ -380,13 +379,22 @@ fn cmd_parse(args: ParseArgs) -> Result<()> {
 
 fn print_report(report: &pipeline::RunReport) {
     let s = report.stats;
-    println!("layout version    {} ({} B records)", report.spec_version, report.record_length);
-    println!("decompressed      {}", human_bytes(report.bytes_decompressed));
+    println!(
+        "layout version    {} ({} B records)",
+        report.spec_version, report.record_length
+    );
+    println!(
+        "decompressed      {}",
+        human_bytes(report.bytes_decompressed)
+    );
     println!("rows read         {}", s.rows_read);
     println!("rows written      {}", s.rows_emitted);
     println!("rows filtered out {}", s.rows_filtered);
     if s.rows_malformed > 0 {
-        println!("rows malformed    {}  <-- inspect before trusting this output", s.rows_malformed);
+        println!(
+            "rows malformed    {}  <-- inspect before trusting this output",
+            s.rows_malformed
+        );
     }
     println!("partitions        {}", report.partitions);
     println!("threads           {}", report.threads);
@@ -407,7 +415,11 @@ fn print_report(report: &pipeline::RunReport) {
 
 fn cmd_run(spec_path: &Path, dry_run: bool) -> Result<()> {
     let jobs = spec::load(spec_path)?;
-    eprintln!("nsetick: {} job(s) from {}", jobs.len(), spec_path.display());
+    eprintln!(
+        "nsetick: {} job(s) from {}",
+        jobs.len(),
+        spec_path.display()
+    );
 
     for (i, job) in jobs.iter().enumerate() {
         let r = &job.request;
@@ -432,8 +444,13 @@ fn cmd_run(spec_path: &Path, dry_run: bool) -> Result<()> {
     let started = std::time::Instant::now();
     let mut total_rows = 0u64;
     for (i, job) in jobs.iter().enumerate() {
-        println!("
---- job {}/{}: {} ---", i + 1, jobs.len(), job.request.input.display());
+        println!(
+            "
+--- job {}/{}: {} ---",
+            i + 1,
+            jobs.len(),
+            job.request.input.display()
+        );
         let report = pipeline::run(&job.request)?;
         total_rows += report.stats.rows_emitted;
         print_report(&report);
@@ -492,7 +509,10 @@ fn cmd_describe(layout_id: &str, date: Option<String>) -> Result<()> {
         v.record_length,
         if v.verified { "" } else { "  [UNVERIFIED]" }
     );
-    println!("{:<22} {:>6} {:>5}  {:<11} {}", "field", "offset", "len", "type", "notes");
+    println!(
+        "{:<22} {:>6} {:>5}  {:<11} {}",
+        "field", "offset", "len", "type", "notes"
+    );
     for f in &v.fields {
         let mut notes = Vec::new();
         if let Some(p) = f.pad {
@@ -513,7 +533,12 @@ fn cmd_describe(layout_id: &str, date: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_inspect(input: PathBuf, layout_id: Option<String>, date: Option<String>, n: usize) -> Result<()> {
+fn cmd_inspect(
+    input: PathBuf,
+    layout_id: Option<String>,
+    date: Option<String>,
+    n: usize,
+) -> Result<()> {
     let layout_id = resolve_layout(&layout_id, &input)?;
     let date = resolve_date(&date, &input)?;
     let l = layout::load(&layout_id)?;
@@ -576,13 +601,22 @@ mod tests {
 
     #[test]
     fn layout_is_inferred_from_nse_file_names() {
-        assert_eq!(infer_layout(Path::new("CASH_Orders_27012022.DAT.gz")), Some("cm_orders"));
-        assert_eq!(infer_layout(Path::new("CASH_Trades_27012022.DAT.gz")), Some("cm_trades"));
+        assert_eq!(
+            infer_layout(Path::new("CASH_Orders_27012022.DAT.gz")),
+            Some("cm_orders")
+        );
+        assert_eq!(
+            infer_layout(Path::new("CASH_Trades_27012022.DAT.gz")),
+            Some("cm_trades")
+        );
         assert_eq!(
             infer_layout(Path::new("FAO_Orders_27012022_01.DAT.gz")),
             Some("fao_orders")
         );
-        assert_eq!(infer_layout(Path::new("CDS_Trades_27012022.DAT.gz")), Some("cd_trades"));
+        assert_eq!(
+            infer_layout(Path::new("CDS_Trades_27012022.DAT.gz")),
+            Some("cd_trades")
+        );
         assert_eq!(infer_layout(Path::new("something_else.gz")), None);
     }
 

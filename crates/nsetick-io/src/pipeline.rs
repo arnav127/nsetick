@@ -415,27 +415,28 @@ fn execute(
             decode_handles.push(scope.spawn(move || {
                 for (seq, chunk) in rx.iter() {
                     let mut local = Stats::default();
-                    let decoded = decoder
-                        .decode(&chunk, &predicate, &mut local)
-                        .and_then(|batch| {
-                            let mut by_shard: Vec<Vec<(String, RecordBatch)>> =
-                                vec![Vec::new(); shards];
-                            if batch.num_rows() > 0 {
-                                match part_col {
-                                    None => by_shard[0].push((String::new(), batch)),
-                                    Some(idx) => {
-                                        for (key, slice) in split_by_partition(&batch, idx)? {
-                                            by_shard[shard_of(&key, shards)].push((key, slice));
+                    let decoded =
+                        decoder
+                            .decode(&chunk, &predicate, &mut local)
+                            .and_then(|batch| {
+                                let mut by_shard: Vec<Vec<(String, RecordBatch)>> =
+                                    vec![Vec::new(); shards];
+                                if batch.num_rows() > 0 {
+                                    match part_col {
+                                        None => by_shard[0].push((String::new(), batch)),
+                                        Some(idx) => {
+                                            for (key, slice) in split_by_partition(&batch, idx)? {
+                                                by_shard[shard_of(&key, shards)].push((key, slice));
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Ok(Decoded {
-                                seq,
-                                by_shard,
-                                stats: local,
-                            })
-                        });
+                                Ok(Decoded {
+                                    seq,
+                                    by_shard,
+                                    stats: local,
+                                })
+                            });
                     let failed = decoded.is_err();
                     if tx.send(decoded).is_err() || failed {
                         break;
@@ -523,7 +524,8 @@ fn execute(
         drop(dec_rx);
 
         for h in decode_handles {
-            h.join().map_err(|_| anyhow::anyhow!("a decode worker panicked"))?;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("a decode worker panicked"))?;
         }
         for h in writer_handles {
             let part = h

@@ -12,13 +12,34 @@ use serde::Deserialize;
 
 /// The spec files, embedded. Adding a layout means adding it here and in `spec/layouts`.
 const EMBEDDED: &[(&str, &str)] = &[
-    ("cm_orders", include_str!("../../../spec/layouts/cm_orders.toml")),
-    ("cm_trades", include_str!("../../../spec/layouts/cm_trades.toml")),
-    ("cm_index", include_str!("../../../spec/layouts/cm_index.toml")),
-    ("fao_orders", include_str!("../../../spec/layouts/fao_orders.toml")),
-    ("fao_trades", include_str!("../../../spec/layouts/fao_trades.toml")),
-    ("cd_orders", include_str!("../../../spec/layouts/cd_orders.toml")),
-    ("cd_trades", include_str!("../../../spec/layouts/cd_trades.toml")),
+    (
+        "cm_orders",
+        include_str!("../../../spec/layouts/cm_orders.toml"),
+    ),
+    (
+        "cm_trades",
+        include_str!("../../../spec/layouts/cm_trades.toml"),
+    ),
+    (
+        "cm_index",
+        include_str!("../../../spec/layouts/cm_index.toml"),
+    ),
+    (
+        "fao_orders",
+        include_str!("../../../spec/layouts/fao_orders.toml"),
+    ),
+    (
+        "fao_trades",
+        include_str!("../../../spec/layouts/fao_trades.toml"),
+    ),
+    (
+        "cd_orders",
+        include_str!("../../../spec/layouts/cd_orders.toml"),
+    ),
+    (
+        "cd_trades",
+        include_str!("../../../spec/layouts/cd_trades.toml"),
+    ),
 ];
 
 /// NSE writes a literal `b` (0x62) as its blank fill byte, because the layout document
@@ -156,10 +177,18 @@ impl Version {
         let mut seen = std::collections::HashSet::new();
         for f in &self.fields {
             if !seen.insert(f.name.as_str()) {
-                bail!("{layout_id}@{}: duplicate field {}", self.spec_version, f.name);
+                bail!(
+                    "{layout_id}@{}: duplicate field {}",
+                    self.spec_version,
+                    f.name
+                );
             }
             if f.len == 0 {
-                bail!("{layout_id}@{}: {} has zero length", self.spec_version, f.name);
+                bail!(
+                    "{layout_id}@{}: {} has zero length",
+                    self.spec_version,
+                    f.name
+                );
             }
             if f.offset != cursor {
                 bail!(
@@ -213,7 +242,10 @@ impl Layout {
         let layout: Layout =
             toml::from_str(toml_src).with_context(|| format!("parsing layout {id}"))?;
         if layout.meta.id != id {
-            bail!("layout id {:?} does not match file name {id:?}", layout.meta.id);
+            bail!(
+                "layout id {:?} does not match file name {id:?}",
+                layout.meta.id
+            );
         }
         for v in &layout.versions {
             v.validate(id)?;

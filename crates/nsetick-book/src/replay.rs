@@ -20,7 +20,8 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use arrow::array::{
-    Array, BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array, UInt8Array,
+    Array, BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray, UInt64Array,
+    UInt8Array,
 };
 use arrow::record_batch::RecordBatch;
 use chrono::NaiveDate;
@@ -33,8 +34,8 @@ use nsetick_io::reader::RecordReader;
 use nsetick_io::writer::{PartitionedWriter, WriterOptions};
 
 use crate::book::{OrderEvent, Side};
-use crate::stream::SymbolReplay;
 use crate::snapshot::SnapshotBuilder;
+use crate::stream::SymbolReplay;
 
 /// Columns the replay needs from the orders feed. Projecting to just these is a large part of
 /// why replaying from the raw file beats reading a full parquet.
@@ -60,7 +61,12 @@ pub const REQUIRED_FIELDS: &[&str] = &[
 /// wrong in two directions: market orders (price 0 in the feed) were rejected outright, so
 /// the liquidity they consumed stayed in the book, and stop-loss orders rested at their limit
 /// before they had triggered, so other orders filled against liquidity that did not yet exist.
-pub const OPTIONAL_FIELDS: &[&str] = &["ioc_flag", "mkt_order_flag", "stop_loss_flag", "trigger_price"];
+pub const OPTIONAL_FIELDS: &[&str] = &[
+    "ioc_flag",
+    "mkt_order_flag",
+    "stop_loss_flag",
+    "trigger_price",
+];
 
 #[derive(Debug, Clone)]
 pub struct ReplayRequest {
@@ -177,7 +183,8 @@ pub fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<OrderEve
     let trigger = batch
         .column_by_name("trigger_price")
         .and_then(|c| c.as_any().downcast_ref::<Int64Array>());
-    let is_set = |a: Option<&BooleanArray>, i: usize| a.is_some_and(|a| !a.is_null(i) && a.value(i));
+    let is_set =
+        |a: Option<&BooleanArray>, i: usize| a.is_some_and(|a| !a.is_null(i) && a.value(i));
 
     let mut out: Vec<(String, Vec<OrderEvent>)> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
@@ -187,7 +194,8 @@ pub fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<OrderEve
         if symbol.is_null(i) || time.is_null(i) || order_no.is_null(i) || activity.is_null(i) {
             continue;
         }
-        let Some(s) = Side::from_byte(side.value(i).as_bytes().first().copied().unwrap_or(0)) else {
+        let Some(s) = Side::from_byte(side.value(i).as_bytes().first().copied().unwrap_or(0))
+        else {
             continue;
         };
 
@@ -196,11 +204,23 @@ pub fn events_by_symbol(batch: &RecordBatch) -> Result<Vec<(String, Vec<OrderEve
             order_number: order_no.value(i),
             side: s,
             price: if price.is_null(i) { 0 } else { price.value(i) },
-            volume_disclosed: if disclosed.is_null(i) { 0 } else { disclosed.value(i) as i64 },
-            volume_original: if original.is_null(i) { 0 } else { original.value(i) as i64 },
+            volume_disclosed: if disclosed.is_null(i) {
+                0
+            } else {
+                disclosed.value(i) as i64
+            },
+            volume_original: if original.is_null(i) {
+                0
+            } else {
+                original.value(i) as i64
+            },
             timestamp: time.value(i),
             algo_indicator: if algo.is_null(i) { 255 } else { algo.value(i) },
-            client_identity: if client.is_null(i) { 255 } else { client.value(i) },
+            client_identity: if client.is_null(i) {
+                255
+            } else {
+                client.value(i)
+            },
             ioc: is_set(ioc, i),
             market: is_set(market, i),
             stop_loss: is_set(stop, i),
@@ -236,7 +256,11 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
 
     let select: Vec<String> = REQUIRED_FIELDS
         .iter()
-        .chain(OPTIONAL_FIELDS.iter().filter(|f| version.field(f).is_some()))
+        .chain(
+            OPTIONAL_FIELDS
+                .iter()
+                .filter(|f| version.field(f).is_some()),
+        )
         .map(|s| s.to_string())
         .collect();
     let decoder = Arc::new(Decoder::new(
@@ -250,10 +274,7 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
         Some(req.session_date),
     )?);
 
-    let threads = req
-        .threads
-        .unwrap_or_else(pipeline::default_threads)
-        .max(1);
+    let threads = req.threads.unwrap_or_else(pipeline::default_threads).max(1);
     let shards = threads;
     let interval_micros = (req.interval_secs * 1_000_000.0).round() as i64;
     let line_len = version.line_length();
@@ -449,7 +470,8 @@ pub fn run(req: &ReplayRequest) -> Result<ReplayReport> {
         drop(dec_rx);
 
         for h in decoders {
-            h.join().map_err(|_| anyhow::anyhow!("a decode worker panicked"))?;
+            h.join()
+                .map_err(|_| anyhow::anyhow!("a decode worker panicked"))?;
         }
         for h in workers {
             let o = h

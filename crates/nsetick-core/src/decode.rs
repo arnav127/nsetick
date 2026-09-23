@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use arrow::array::{
-    ArrayRef, BooleanBuilder, Date32Builder, Int64Builder, StringBuilder,
-    Time32SecondBuilder, TimestampMicrosecondBuilder, UInt64Builder, UInt8Builder,
+    ArrayRef, BooleanBuilder, Date32Builder, Int64Builder, StringBuilder, Time32SecondBuilder,
+    TimestampMicrosecondBuilder, UInt64Builder, UInt8Builder,
 };
 use arrow::datatypes::{DataType, Field as ArrowField, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -90,8 +90,14 @@ fn arrow_field(f: &Field) -> ArrowField {
         meta.insert("units".into(), format!("10^-{scale}"));
     }
     if f.ty == FieldType::Jiffies {
-        meta.insert("timezone".into(), "Asia/Kolkata (wall clock, not UTC)".into());
-        meta.insert("source".into(), "NSE jiffies, 65536/s from 1980-01-01".into());
+        meta.insert(
+            "timezone".into(),
+            "Asia/Kolkata (wall clock, not UTC)".into(),
+        );
+        meta.insert(
+            "source".into(),
+            "NSE jiffies, 65536/s from 1980-01-01".into(),
+        );
     }
     if !f.doc.is_empty() {
         meta.insert("doc".into(), f.doc.clone());
@@ -242,8 +248,7 @@ impl Decoder {
 
         stats.rows_emitted += keep.len() as u64;
 
-        RecordBatch::try_new(Arc::clone(&self.schema), columns)
-            .context("assembling record batch")
+        RecordBatch::try_new(Arc::clone(&self.schema), columns).context("assembling record batch")
     }
 
     fn build_column(&self, f: &Field, buf: &[u8], keep: &[usize]) -> Result<ArrayRef> {
@@ -464,7 +469,12 @@ POCASH100000000000210187014847293583B1ADANIPOWEREQ000000000000005000009800000000
         let (batch, _) = decode_with(Some(sel), "");
         assert_eq!(batch.num_columns(), 2);
         assert_eq!(
-            batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
             vec!["symbol", "limit_price"]
         );
     }
@@ -493,7 +503,11 @@ POCASH100000000000210187014847293583B1ADANIPOWEREQ000000000000005000009800000000
             Some(vec!["symbol".into()]),
             "series == 'EQ' and buy_sell == 'B' and limit_price < 50000",
         );
-        let col = batch.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         assert_eq!(col.len(), 1);
         assert_eq!(col.value(0), "ADANIPOWER");
     }
@@ -534,8 +548,15 @@ POCASH100000000000210187014847293583B1ADANIPOWEREQ000000000000005000009800000000
     #[test]
     fn numeric_fields_decode_to_their_values() {
         let (batch, _) = decode_with(Some(vec!["volume_original".into()]), "");
-        let col = batch.column(0).as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!((0..4).map(|i| col.value(i)).collect::<Vec<_>>(), vec![76, 75, 300, 50]);
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(
+            (0..4).map(|i| col.value(i)).collect::<Vec<_>>(),
+            vec![76, 75, 300, 50]
+        );
     }
 
     #[test]
@@ -560,7 +581,9 @@ POCASH100000000000210187014847293583B1ADANIPOWEREQ000000000000005000009800000000
         let dec = Decoder::new(v, None, DecodeOptions::default()).unwrap();
         let mut stats = Stats::default();
         // 4 * 88 = 352 bytes; not a multiple of 101, so framing fails immediately.
-        let err = dec.decode(SAMPLE, &Predicate::True, &mut stats).unwrap_err();
+        let err = dec
+            .decode(SAMPLE, &Predicate::True, &mut stats)
+            .unwrap_err();
         assert!(err.to_string().contains("whole number"), "{err}");
     }
 

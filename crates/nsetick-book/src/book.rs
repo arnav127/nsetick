@@ -110,7 +110,8 @@ impl PendingStops {
     fn hold(&mut self, ev: OrderEvent) {
         self.next_seq += 1;
         let key = (ev.trigger_price, self.next_seq);
-        self.index.insert(ev.order_number, (ev.side, ev.trigger_price, self.next_seq));
+        self.index
+            .insert(ev.order_number, (ev.side, ev.trigger_price, self.next_seq));
         match ev.side {
             Side::Buy => self.buys.insert(key, ev),
             Side::Sell => self.sells.insert(key, ev),
@@ -128,8 +129,16 @@ impl PendingStops {
     /// Remove and return every stop the last trade price triggers, in arrival order.
     fn triggered_by(&mut self, ltp: i64) -> Vec<OrderEvent> {
         let mut keys: Vec<(u64, Side, (i64, u64))> = Vec::new();
-        keys.extend(self.buys.range(..=(ltp, u64::MAX)).map(|(k, _)| (k.1, Side::Buy, *k)));
-        keys.extend(self.sells.range((ltp, 0)..).map(|(k, _)| (k.1, Side::Sell, *k)));
+        keys.extend(
+            self.buys
+                .range(..=(ltp, u64::MAX))
+                .map(|(k, _)| (k.1, Side::Buy, *k)),
+        );
+        keys.extend(
+            self.sells
+                .range((ltp, 0)..)
+                .map(|(k, _)| (k.1, Side::Sell, *k)),
+        );
         keys.sort_unstable_by_key(|k| k.0);
         let mut out = Vec::with_capacity(keys.len());
         for (_, side, key) in keys {
@@ -436,7 +445,9 @@ impl OrderBook {
     /// and move the price, so repeat until nothing more fires.
     fn release_triggered_stops(&mut self) {
         loop {
-            let Some(ltp) = self.fills.last().map(|f| f.price) else { return };
+            let Some(ltp) = self.fills.last().map(|f| f.price) else {
+                return;
+            };
             self.last_trade_price = Some(ltp);
             if self.stops.len() == 0 {
                 return;
@@ -514,7 +525,11 @@ impl OrderBook {
             side: ev.side,
             price: ev.price,
             visible: rest_visible,
-            tranche: if is_iceberg { ev.volume_disclosed } else { remaining },
+            tranche: if is_iceberg {
+                ev.volume_disclosed
+            } else {
+                remaining
+            },
             hidden: remaining - rest_visible,
             remaining,
             is_iceberg,
@@ -632,7 +647,9 @@ impl OrderBook {
             let reveal_next = order.visible <= 0 && order.is_iceberg && !exhausted;
             let rest_price = order.price;
 
-            self.level_mut(opposite, price).expect("level exists").visible -= fill;
+            self.level_mut(opposite, price)
+                .expect("level exists")
+                .visible -= fill;
             taken += fill;
             self.fills.push(Fill {
                 price: rest_price,
@@ -675,7 +692,9 @@ impl OrderBook {
 
     /// Make the next hidden tranche of an iceberg visible.
     fn reveal_tranche(&mut self, id: u64, side: Side, price: i64) {
-        let Some(order) = self.orders.get_mut(&id) else { return };
+        let Some(order) = self.orders.get_mut(&id) else {
+            return;
+        };
         let reveal = order.tranche.min(order.remaining);
         if reveal <= 0 {
             return;
@@ -810,7 +829,9 @@ impl OrderBook {
         let Some(level) = level else { return out };
 
         for &(id, seq) in level.queue.iter() {
-            let Some(o) = self.orders.get(&id) else { continue };
+            let Some(o) = self.orders.get(&id) else {
+                continue;
+            };
             if o.seq != seq || o.visible <= 0 {
                 continue;
             }
@@ -853,7 +874,14 @@ impl Side {
 mod tests {
     use super::*;
 
-    fn ev(activity: u8, id: u64, side: Side, price: i64, disclosed: i64, original: i64) -> OrderEvent {
+    fn ev(
+        activity: u8,
+        id: u64,
+        side: Side,
+        price: i64,
+        disclosed: i64,
+        original: i64,
+    ) -> OrderEvent {
         OrderEvent {
             activity_type: activity,
             order_number: id,
@@ -965,7 +993,11 @@ mod tests {
         b.apply(&stop(2, Side::Sell, 99_00, 99_50, 10));
         b.apply(&limit(3, Side::Buy, 99_60, 1));
         b.apply(&limit(4, Side::Sell, 99_60, 1));
-        assert_eq!(b.pending_stops(), 1, "a trade above a sell trigger does not fire it");
+        assert_eq!(
+            b.pending_stops(),
+            1,
+            "a trade above a sell trigger does not fire it"
+        );
         b.apply(&limit(5, Side::Buy, 99_50, 1));
         b.apply(&limit(6, Side::Sell, 99_50, 1));
         assert_eq!(b.pending_stops(), 0);
@@ -979,7 +1011,11 @@ mod tests {
         let mut moved = stop(1, Side::Buy, 102_00, 101_50, 10);
         moved.activity_type = MODIFY;
         b.apply(&moved);
-        assert_eq!(b.pending_stops(), 1, "a modified stop stays held under its new trigger");
+        assert_eq!(
+            b.pending_stops(),
+            1,
+            "a modified stop stays held under its new trigger"
+        );
         b.apply(&cancel(1, Side::Buy));
         assert_eq!(b.pending_stops(), 0);
         assert_eq!(b.stats().unknown_order_refs, 0);
@@ -1030,7 +1066,11 @@ mod tests {
         }
         b.apply(&resting);
         b.apply(&incoming);
-        assert_eq!(b.last_fills()[0].resting_order, 1, "an ordinary later cancel is not a prevention");
+        assert_eq!(
+            b.last_fills()[0].resting_order,
+            1,
+            "an ordinary later cancel is not a prevention"
+        );
         assert_eq!(b.stats().self_trade_preventions, 0);
     }
 
@@ -1156,7 +1196,11 @@ mod tests {
         let mut b = OrderBook::new("TEST");
         // 1000 total, 100 disclosed.
         b.apply(&ev(ENTRY, 1, Side::Sell, 100_00, 100, 1000));
-        assert_eq!(b.total_visible(Side::Sell), 100, "only the tranche is visible");
+        assert_eq!(
+            b.total_visible(Side::Sell),
+            100,
+            "only the tranche is visible"
+        );
         assert_eq!(b.resting_hidden_volume(), 900);
         assert_eq!(b.active_icebergs(), 1);
         let top = b.top_levels(Side::Sell, 1);
@@ -1170,7 +1214,11 @@ mod tests {
         b.apply(&limit(2, Side::Buy, 100_00, 100)); // exactly consumes the tranche
 
         assert_eq!(b.stats().replenishments, 1);
-        assert_eq!(b.total_visible(Side::Sell), 100, "next tranche is now showing");
+        assert_eq!(
+            b.total_visible(Side::Sell),
+            100,
+            "next tranche is now showing"
+        );
         assert_eq!(b.resting_hidden_volume(), 800);
         assert_eq!(b.best_ask(), Some(100_00));
     }
@@ -1186,7 +1234,8 @@ mod tests {
         // The iceberg revealed a new tranche, so the plain order should now be ahead of it.
         b.apply(&limit(4, Side::Buy, 100_00, 10));
         assert_eq!(
-            b.last_fills()[0].resting_order, 2,
+            b.last_fills()[0].resting_order,
+            2,
             "revealed liquidity must go behind orders already queued"
         );
     }
@@ -1273,8 +1322,16 @@ mod tests {
         }
         let bids: Vec<i64> = b.top_levels(Side::Buy, 3).iter().map(|l| l.0).collect();
         let asks: Vec<i64> = b.top_levels(Side::Sell, 3).iter().map(|l| l.0).collect();
-        assert_eq!(bids, vec![100_00, 99_00, 98_00], "bids descend from the best");
-        assert_eq!(asks, vec![101_00, 102_00, 103_00], "asks ascend from the best");
+        assert_eq!(
+            bids,
+            vec![100_00, 99_00, 98_00],
+            "bids descend from the best"
+        );
+        assert_eq!(
+            asks,
+            vec![101_00, 102_00, 103_00],
+            "asks ascend from the best"
+        );
     }
 
     #[test]
@@ -1305,7 +1362,12 @@ mod tests {
         b.apply(&limit(1, Side::Sell, 100_00, 10));
         // A buy far above the ask must match rather than rest above it.
         b.apply(&limit(2, Side::Buy, 105_00, 5));
-        assert!(!b.is_crossed(), "bid {:?} ask {:?}", b.best_bid(), b.best_ask());
+        assert!(
+            !b.is_crossed(),
+            "bid {:?} ask {:?}",
+            b.best_bid(),
+            b.best_ask()
+        );
         assert_eq!(b.best_ask(), Some(100_00));
         assert_eq!(b.best_bid(), None);
     }

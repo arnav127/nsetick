@@ -165,7 +165,10 @@ pub fn load(path: &Path) -> Result<Vec<ResolvedJob>> {
     };
 
     if jobs.is_empty() {
-        bail!("{}: \"jobs\" is empty, so there is nothing to run", path.display());
+        bail!(
+            "{}: \"jobs\" is empty, so there is nothing to run",
+            path.display()
+        );
     }
 
     let base = path.parent().unwrap_or(Path::new("."));
@@ -232,14 +235,18 @@ fn resolve(job: &JobSpec, base: &Path, index: usize) -> Result<ResolvedJob> {
     let defaults = WriterOptions::default();
     request.writer = WriterOptions {
         compression: match &job.compression {
-            Some(c) => parse_compression(c)
-                .with_context(|| format!("job {index}: \"compression\""))?,
+            Some(c) => {
+                parse_compression(c).with_context(|| format!("job {index}: \"compression\""))?
+            }
             None => defaults.compression,
         },
         row_group_rows: job.row_group_rows.unwrap_or(defaults.row_group_rows),
         // Superseded by request.memory_limit, which is shared across shards.
         max_buffered_bytes: defaults.max_buffered_bytes,
-        data_page_size: job.data_page_kb.map(|kb| kb * 1024).unwrap_or(defaults.data_page_size),
+        data_page_size: job
+            .data_page_kb
+            .map(|kb| kb * 1024)
+            .unwrap_or(defaults.data_page_size),
         // Distinguishes "absent" (use the default) from "present but null" (do not partition).
         partition_by: match &job.partition_by {
             None => defaults.partition_by,
@@ -280,7 +287,10 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         let r = &jobs[0].request;
         assert_eq!(r.layout_id, "cm_orders");
-        assert_eq!(r.session_date, NaiveDate::from_ymd_opt(2022, 1, 27).unwrap());
+        assert_eq!(
+            r.session_date,
+            NaiveDate::from_ymd_opt(2022, 1, 27).unwrap()
+        );
         assert_eq!(r.filter, "series == 'EQ'");
         assert_eq!(r.select.as_deref().unwrap().len(), 2);
         // Relative paths resolve against the spec file, not the process directory.
@@ -319,7 +329,10 @@ mod tests {
             r#"{ "input": "CASH_Orders_27012022.DAT.gz", "out": "o", "wheer": "x" }"#,
         );
         let err = format!("{:#}", load(&p).unwrap_err());
-        assert!(err.contains("wheer") || err.contains("unknown field"), "{err}");
+        assert!(
+            err.contains("wheer") || err.contains("unknown field"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -59,9 +59,8 @@ fn resolve_layout(explicit: Option<&str>, path: &std::path::Path) -> PyResult<St
 
 fn resolve_date(explicit: Option<&str>, path: &std::path::Path) -> PyResult<NaiveDate> {
     match explicit {
-        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
-            PyValueError::new_err(format!("date {s:?} is not YYYY-MM-DD: {e}"))
-        }),
+        Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .map_err(|e| PyValueError::new_err(format!("date {s:?} is not YYYY-MM-DD: {e}"))),
         None => infer_date(path).ok_or_else(|| {
             PyValueError::new_err(format!(
                 "cannot infer a session date from {:?}; pass date='YYYY-MM-DD'",
@@ -90,8 +89,7 @@ fn stats_dict<'py>(py: Python<'py>, s: &Stats) -> PyResult<Bound<'py, PyDict>> {
 /// propagate, which unwinds through the normal shutdown path and closes every writer.
 fn interrupt_hook() -> Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync> {
     Arc::new(|| {
-        Python::attach(|py| py.check_signals())
-            .map_err(|e| anyhow::anyhow!("interrupted: {e}"))
+        Python::attach(|py| py.check_signals()).map_err(|e| anyhow::anyhow!("interrupted: {e}"))
     })
 }
 
@@ -157,9 +155,7 @@ fn parse(
     // Parsing a session takes minutes and touches no Python objects, beyond the periodic
     // signal check the hook performs.
     req.interrupt = Some(interrupt_hook());
-    let report = py
-        .detach(|| pipeline::run(&req))
-        .map_err(to_py_err)?;
+    let report = py.detach(|| pipeline::run(&req)).map_err(to_py_err)?;
 
     let d = PyDict::new(py);
     d.set_item("rows_read", report.stats.rows_read)?;
@@ -243,20 +239,19 @@ impl BatchReader {
 
         // Ground the layout version in the file itself, exactly as the CLI does.
         let observed = pipeline::probe_record_length(&input).map_err(to_py_err)?;
-        let version = lay.resolve(session, Some(observed)).map_err(to_py_err)?.clone();
+        let version = lay
+            .resolve(session, Some(observed))
+            .map_err(to_py_err)?
+            .clone();
 
-        let decoder = Decoder::new(
-            &version,
-            select.as_deref(),
-            DecodeOptions { strict },
-        )
-        .map_err(to_py_err)?;
-        let predicate = filter::compile(where_.unwrap_or(""), &version, Some(session))
+        let decoder = Decoder::new(&version, select.as_deref(), DecodeOptions { strict })
             .map_err(to_py_err)?;
+        let predicate =
+            filter::compile(where_.unwrap_or(""), &version, Some(session)).map_err(to_py_err)?;
 
         let line_len = version.line_length();
-        let reader = RecordReader::open(&input, line_len, chunk_mb * 1024 * 1024)
-            .map_err(to_py_err)?;
+        let reader =
+            RecordReader::open(&input, line_len, chunk_mb * 1024 * 1024).map_err(to_py_err)?;
 
         Ok(Self {
             reader,
@@ -283,7 +278,8 @@ impl BatchReader {
                     None => Ok(None),
                     Some(chunk) => {
                         let batch =
-                            self.decoder.decode(&chunk, &self.predicate, &mut self.stats)?;
+                            self.decoder
+                                .decode(&chunk, &self.predicate, &mut self.stats)?;
                         Ok(Some(batch))
                     }
                 }
@@ -375,9 +371,8 @@ fn build_books(
     // the compressed file, and one parallel job per symbol partition.
     if input.is_dir() {
         let session = match date {
-            Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|e| {
-                PyValueError::new_err(format!("date {s:?} is not YYYY-MM-DD: {e}"))
-            })?,
+            Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|e| PyValueError::new_err(format!("date {s:?} is not YYYY-MM-DD: {e}")))?,
             None => input
                 .file_name()
                 .and_then(|n| n.to_str())

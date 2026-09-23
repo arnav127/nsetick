@@ -27,9 +27,9 @@ use nsetick_io::writer::{PartitionedWriter, WriterOptions};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
 
-use crate::stream::{Progress, SymbolReplay};
 use crate::replay::{events_by_symbol, ReplayReport, OPTIONAL_FIELDS, REQUIRED_FIELDS};
 use crate::snapshot::SnapshotBuilder;
+use crate::stream::{Progress, SymbolReplay};
 
 #[derive(Clone)]
 pub struct ParquetReplayRequest {
@@ -75,13 +75,14 @@ fn discover(input: &Path, symbols: &[String]) -> Result<Vec<PathBuf>> {
         return Ok(vec![input.to_path_buf()]);
     }
     if !input.is_dir() {
-        bail!("{} is neither a parquet file nor a directory", input.display());
+        bail!(
+            "{} is neither a parquet file nor a directory",
+            input.display()
+        );
     }
 
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(input)
-        .with_context(|| format!("listing {}", input.display()))?
-    {
+    for entry in std::fs::read_dir(input).with_context(|| format!("listing {}", input.display()))? {
         let path = entry?.path();
         if path.is_dir() {
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
@@ -168,7 +169,8 @@ fn replay_file(
 
     // A single partition file holds one symbol, but a flat file may hold many, so key by
     // symbol rather than assuming.
-    let mut books: std::collections::HashMap<String, SymbolReplay> = std::collections::HashMap::new();
+    let mut books: std::collections::HashMap<String, SymbolReplay> =
+        std::collections::HashMap::new();
     let mut progress = Progress::default();
 
     for batch in &batches {
@@ -202,7 +204,14 @@ fn replay_file(
             crossed += 1;
         }
     }
-    Ok((progress.events, progress.fills, progress.snapshots, replen, books.len(), crossed))
+    Ok((
+        progress.events,
+        progress.fills,
+        progress.snapshots,
+        replen,
+        books.len(),
+        crossed,
+    ))
 }
 
 pub fn run(req: &ParquetReplayRequest) -> Result<ReplayReport> {
@@ -329,7 +338,12 @@ mod tests {
 
     #[test]
     fn a_missing_directory_is_reported_clearly() {
-        let err = discover(Path::new("does/not/exist"), &[]).unwrap_err().to_string();
-        assert!(err.contains("neither a parquet file nor a directory"), "{err}");
+        let err = discover(Path::new("does/not/exist"), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("neither a parquet file nor a directory"),
+            "{err}"
+        );
     }
 }

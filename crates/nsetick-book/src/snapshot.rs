@@ -37,15 +37,29 @@ pub fn schema(levels: usize) -> SchemaRef {
         for i in 1..=levels {
             f.push(Field::new(format!("{side}_px_{i}"), DataType::Int64, true));
             f.push(Field::new(format!("{side}_qty_{i}"), DataType::Int64, true));
-            f.push(Field::new(format!("{side}_hidden_{i}"), DataType::Int64, true));
+            f.push(Field::new(
+                format!("{side}_hidden_{i}"),
+                DataType::Int64,
+                true,
+            ));
         }
     }
     // Touch composition and per-interval event counts. Neither can be recovered from an L2
     // snapshot downstream: the first needs to know which resting orders are at the touch,
     // the second needs the events between two snapshots.
     for side in ["bid", "ask"] {
-        for name in ["algo_qty", "custodian_qty", "iceberg_qty", "iceberg_hidden", "orders"] {
-            let ty = if name == "orders" { DataType::UInt32 } else { DataType::Int64 };
+        for name in [
+            "algo_qty",
+            "custodian_qty",
+            "iceberg_qty",
+            "iceberg_hidden",
+            "orders",
+        ] {
+            let ty = if name == "orders" {
+                DataType::UInt32
+            } else {
+                DataType::Int64
+            };
             f.push(Field::new(format!("touch_{side}_{name}"), ty, false));
         }
     }
@@ -73,7 +87,10 @@ pub fn schema(levels: usize) -> SchemaRef {
         .into_iter()
         .map(|field| {
             let is_price = field.name().contains("_px_")
-                || matches!(field.name().as_str(), "best_bid" | "best_ask" | "mid_price" | "spread");
+                || matches!(
+                    field.name().as_str(),
+                    "best_bid" | "best_ask" | "mid_price" | "spread"
+                );
             if is_price {
                 let mut m = std::collections::HashMap::new();
                 m.insert("scale".to_string(), "2".to_string());
@@ -152,7 +169,13 @@ impl SnapshotBuilder {
             mid: Float64Builder::new(),
             spread: Int64Builder::new(),
             levels_b: (0..levels * 2)
-                .map(|_| [Int64Builder::new(), Int64Builder::new(), Int64Builder::new()])
+                .map(|_| {
+                    [
+                        Int64Builder::new(),
+                        Int64Builder::new(),
+                        Int64Builder::new(),
+                    ]
+                })
                 .collect(),
             total_bid: Int64Builder::new(),
             total_ask: Int64Builder::new(),
@@ -337,7 +360,11 @@ mod tests {
             );
         }
         // Quantities are not prices.
-        assert!(s.field_with_name("bid_qty_1").unwrap().metadata().is_empty());
+        assert!(s
+            .field_with_name("bid_qty_1")
+            .unwrap()
+            .metadata()
+            .is_empty());
     }
 
     #[test]
@@ -366,7 +393,11 @@ mod tests {
         assert_eq!(col("bid_px_1"), 100_00);
         assert_eq!(col("bid_qty_1"), 50);
         assert_eq!(col("bid_px_2"), 99_00);
-        assert_eq!(col("ask_qty_1"), 100, "only the disclosed tranche is visible");
+        assert_eq!(
+            col("ask_qty_1"),
+            100,
+            "only the disclosed tranche is visible"
+        );
         assert_eq!(col("ask_hidden_1"), 900, "the rest is reported as hidden");
         assert_eq!(col("resting_hidden"), 900);
 

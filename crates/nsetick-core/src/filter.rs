@@ -87,7 +87,12 @@ impl TextSet {
     pub fn new(needles: Vec<Vec<u8>>) -> Self {
         let has_empty = needles.iter().any(|n| n.is_empty());
         if needles.len() <= LINEAR_MAX {
-            return Self { small: needles, buckets: Vec::new(), stride: 0, has_empty };
+            return Self {
+                small: needles,
+                buckets: Vec::new(),
+                stride: 0,
+                has_empty,
+            };
         }
         let max_len = needles.iter().map(|n| n.len()).max().unwrap_or(0);
         let stride = max_len + 1;
@@ -98,7 +103,12 @@ impl TextSet {
             }
             buckets[n[0] as usize * stride + n.len()].push(n.clone());
         }
-        Self { small: Vec::new(), buckets, stride, has_empty }
+        Self {
+            small: Vec::new(),
+            buckets,
+            stride,
+            has_empty,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -118,7 +128,11 @@ impl TextSet {
         if self.buckets.is_empty() {
             self.small.iter().map(|n| n.as_slice()).collect()
         } else {
-            self.buckets.iter().flatten().map(|n| n.as_slice()).collect()
+            self.buckets
+                .iter()
+                .flatten()
+                .map(|n| n.as_slice())
+                .collect()
         }
     }
 
@@ -174,7 +188,10 @@ pub enum Predicate {
     },
 
     /// A single-byte Y/N flag.
-    FlagIs { offset: usize, want: bool },
+    FlagIs {
+        offset: usize,
+        want: bool,
+    },
 
     /// Comparison between two numeric fields of the same record.
     ///
@@ -447,9 +464,17 @@ impl<'a> Parser<'a> {
 
     fn field(&self, name: &str) -> Result<&'a Field> {
         self.version.field(name).ok_or_else(|| {
-            let mut names: Vec<&str> = self.version.fields.iter().map(|f| f.name.as_str()).collect();
+            let mut names: Vec<&str> = self
+                .version
+                .fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect();
             names.sort_unstable();
-            anyhow!("unknown field {name:?}; this layout has: {}", names.join(", "))
+            anyhow!(
+                "unknown field {name:?}; this layout has: {}",
+                names.join(", ")
+            )
         })
     }
 
@@ -554,7 +579,10 @@ impl<'a> Parser<'a> {
     fn binary_comparison(&mut self, field: &Field) -> Result<Predicate> {
         let op = match self.next() {
             Some(Tok::Op(o)) => o,
-            other => bail!("expected a comparison operator after {}, found {other:?}", field.name),
+            other => bail!(
+                "expected a comparison operator after {}, found {other:?}",
+                field.name
+            ),
         };
 
         // A bare identifier on the right means a field-to-field comparison.
@@ -612,7 +640,10 @@ impl<'a> Parser<'a> {
 
             Some(t @ (Tok::True | Tok::False)) => {
                 if field.ty != FieldType::BoolYn {
-                    bail!("{} is not a Y/N flag, so it cannot be compared to a boolean", field.name);
+                    bail!(
+                        "{} is not a Y/N flag, so it cannot be compared to a boolean",
+                        field.name
+                    );
                 }
                 if !matches!(op, CmpOp::Eq | CmpOp::Ne) {
                     bail!("only == and != are supported on flag field {}", field.name);
@@ -664,7 +695,11 @@ impl<'a> Parser<'a> {
 ///
 /// Both sides must be numeric and share a scale, so comparing a price against a share count
 /// is rejected rather than silently comparing different units.
-pub fn compile(expr: &str, version: &Version, session_date: Option<NaiveDate>) -> Result<Predicate> {
+pub fn compile(
+    expr: &str,
+    version: &Version,
+    session_date: Option<NaiveDate>,
+) -> Result<Predicate> {
     let trimmed = expr.trim();
     if trimmed.is_empty() {
         return Ok(Predicate::True);
@@ -676,7 +711,9 @@ pub fn compile(expr: &str, version: &Version, session_date: Option<NaiveDate>) -
         version,
         session_date,
     };
-    let pred = p.expr().with_context(|| format!("parsing filter {trimmed:?}"))?;
+    let pred = p
+        .expr()
+        .with_context(|| format!("parsing filter {trimmed:?}"))?;
     if p.pos != p.toks.len() {
         bail!(
             "trailing input in filter {trimmed:?} at token {}: {:?}",
@@ -741,7 +778,10 @@ mod tests {
         assert!(check("volume_original == 76", BALKRISIND));
         assert!(check("volume_original > 75", BALKRISIND));
         assert!(!check("volume_original > 76", BALKRISIND));
-        assert!(check("volume_original >= 75 and volume_original <= 76", BCG));
+        assert!(check(
+            "volume_original >= 75 and volume_original <= 76",
+            BCG
+        ));
         // limit_price is raw paise: 230000 = 2300.00 rupees.
         assert!(check("limit_price == 230000", BALKRISIND));
         assert!(check("limit_price > 100000", BALKRISIND));
@@ -766,7 +806,10 @@ mod tests {
     #[test]
     fn boolean_composition_and_precedence() {
         // 'and' binds tighter than 'or'.
-        assert!(check("series == 'BE' or series == 'EQ' and volume_original == 76", BALKRISIND));
+        assert!(check(
+            "series == 'BE' or series == 'EQ' and volume_original == 76",
+            BALKRISIND
+        ));
         assert!(check("not (series == 'BE')", BALKRISIND));
         assert!(check(
             "(symbol == 'BCG' or symbol == 'BALKRISIND') and activity_type == 1",
@@ -782,7 +825,7 @@ mod tests {
         assert!(!check("volume_disclosed > volume_original", BALKRISIND));
         assert!(check("volume_original >= volume_original", BALKRISIND));
         assert!(check("limit_price > trigger_price", BALKRISIND)); // 230000 vs 0, both paise
-        // Neither sample is an iceberg: disclosed quantity is 0 for both.
+                                                                   // Neither sample is an iceberg: disclosed quantity is 0 for both.
         assert!(!check(
             "volume_original > volume_disclosed and volume_disclosed > 0",
             BALKRISIND
@@ -807,10 +850,7 @@ mod tests {
     #[test]
     fn comparing_a_text_field_to_a_field_is_refused() {
         let v = cm_orders();
-        let err = format!(
-            "{:#}",
-            compile("symbol > series", &v, None).unwrap_err()
-        );
+        let err = format!("{:#}", compile("symbol > series", &v, None).unwrap_err());
         assert!(err.contains("numeric"), "{err}");
     }
 
@@ -842,14 +882,20 @@ mod tests {
     #[test]
     fn needle_wider_than_the_field_is_rejected() {
         let v = cm_orders();
-        let err = format!("{:#}", compile("series == 'TOOLONG'", &v, None).unwrap_err());
+        let err = format!(
+            "{:#}",
+            compile("series == 'TOOLONG'", &v, None).unwrap_err()
+        );
         assert!(err.contains("bytes wide"), "{err}");
     }
 
     #[test]
     fn unquoted_time_literal_gets_a_useful_message() {
         let v = cm_orders();
-        let err = format!("{:#}", compile("txn_time >= 09:15:00", &v, None).unwrap_err());
+        let err = format!(
+            "{:#}",
+            compile("txn_time >= 09:15:00", &v, None).unwrap_err()
+        );
         assert!(err.contains("must be quoted"), "{err}");
     }
 }
@@ -877,7 +923,11 @@ mod textset_tests {
         // length collisions real tickers have.
         let names: Vec<String> = (0..500)
             .map(|i| format!("SYM{i}"))
-            .chain(["RELIANCE", "TCS", "M&M", "BAJAJ-AUTO"].iter().map(|s| s.to_string()))
+            .chain(
+                ["RELIANCE", "TCS", "M&M", "BAJAJ-AUTO"]
+                    .iter()
+                    .map(|s| s.to_string()),
+            )
             .collect();
         let refs: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
         let s = set(&refs);

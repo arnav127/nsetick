@@ -13,9 +13,14 @@ use nsetick_core::filter::TextSet;
 fn real_sets() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let raw = include_str!("symbols.txt");
     let norm: String = raw.chars().filter(|c| *c != '\r').collect();
-    let (hits, misses) = norm.split_once("\n---\n").expect("separator in symbols.txt");
+    let (hits, misses) = norm
+        .split_once("\n---\n")
+        .expect("separator in symbols.txt");
     let to_vecs = |s: &str| -> Vec<Vec<u8>> {
-        s.lines().filter(|l| !l.is_empty()).map(|l| l.as_bytes().to_vec()).collect()
+        s.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.as_bytes().to_vec())
+            .collect()
     };
     (to_vecs(hits), to_vecs(misses))
 }
@@ -83,8 +88,14 @@ fn main() {
         "REAL {} NSE tickers, {ROWS} probes, 80% hit rate",
         hits.len()
     );
-    println!("   linear   {lin:>6.2}s   {:>6.1} ns/record", lin / ROWS as f64 * 1e9);
-    println!("   bucketed {buck:>6.2}s   {:>6.1} ns/record", buck / ROWS as f64 * 1e9);
+    println!(
+        "   linear   {lin:>6.2}s   {:>6.1} ns/record",
+        lin / ROWS as f64 * 1e9
+    );
+    println!(
+        "   bucketed {buck:>6.2}s   {:>6.1} ns/record",
+        buck / ROWS as f64 * 1e9
+    );
     println!("   speedup  {:>6.1}x", lin / buck);
     println!(
         "   extrapolated over a 704M-record session: linear {:.0}s, bucketed {:.0}s\n",

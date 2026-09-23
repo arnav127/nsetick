@@ -84,7 +84,8 @@ impl MemoryGuard {
             self.peak.fetch_max(now, Ordering::Relaxed);
         } else {
             let delta = before - after;
-            self.used.fetch_sub(delta.min(self.used()), Ordering::Relaxed);
+            self.used
+                .fetch_sub(delta.min(self.used()), Ordering::Relaxed);
         }
     }
 
@@ -101,7 +102,9 @@ impl MemoryGuard {
         let n = self.partitions.fetch_add(1, Ordering::Relaxed) + 1;
         self.partitions_peak.fetch_max(n, Ordering::Relaxed);
 
-        let projected = n.saturating_mul(self.per_partition).saturating_add(self.buffer_limit);
+        let projected = n
+            .saturating_mul(self.per_partition)
+            .saturating_add(self.buffer_limit);
         if projected > self.footprint_limit {
             let fits = self.footprint_limit.saturating_sub(self.buffer_limit) / self.per_partition;
             bail!(
@@ -261,7 +264,8 @@ mod tests {
         let footprint = 10 * BYTES_PER_OPEN_PARTITION + buffer;
         let g = MemoryGuard::new(footprint, buffer);
         for i in 0..10 {
-            g.open_partition("symbol").unwrap_or_else(|e| panic!("partition {i}: {e}"));
+            g.open_partition("symbol")
+                .unwrap_or_else(|e| panic!("partition {i}: {e}"));
         }
         let err = g.open_partition("symbol").unwrap_err().to_string();
         assert!(err.contains("memory guard"), "{err}");
@@ -316,7 +320,10 @@ mod tests {
         g.open_partition("symbol").unwrap();
         g.open_partition("symbol").unwrap();
         g.open_partition("symbol").unwrap();
-        assert!(g.open_partition("symbol").is_err(), "limit was silently raised");
+        assert!(
+            g.open_partition("symbol").is_err(),
+            "limit was silently raised"
+        );
     }
 
     #[test]

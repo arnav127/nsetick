@@ -244,8 +244,14 @@ mod tests {
 
     #[test]
     fn date32_matches_the_unix_epoch() {
-        assert_eq!(date_to_days(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()), 0);
-        assert_eq!(date_to_days(NaiveDate::from_ymd_opt(1970, 1, 2).unwrap()), 1);
+        assert_eq!(
+            date_to_days(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()),
+            0
+        );
+        assert_eq!(
+            date_to_days(NaiveDate::from_ymd_opt(1970, 1, 2).unwrap()),
+            1
+        );
         assert_eq!(
             date_to_days(NaiveDate::from_ymd_opt(2022, 1, 27).unwrap()),
             19_019

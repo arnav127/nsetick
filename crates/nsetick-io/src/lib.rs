@@ -67,16 +67,31 @@ mod tests {
 
     #[test]
     fn layout_is_inferred_from_nse_file_names() {
-        assert_eq!(infer_layout(Path::new("CASH_Orders_27012022.DAT.gz")), Some("cm_orders"));
-        assert_eq!(infer_layout(Path::new("FAO_Orders_27012022_01.DAT.gz")), Some("fao_orders"));
-        assert_eq!(infer_layout(Path::new("CDS_Trades_27012022.DAT.gz")), Some("cd_trades"));
+        assert_eq!(
+            infer_layout(Path::new("CASH_Orders_27012022.DAT.gz")),
+            Some("cm_orders")
+        );
+        assert_eq!(
+            infer_layout(Path::new("FAO_Orders_27012022_01.DAT.gz")),
+            Some("fao_orders")
+        );
+        assert_eq!(
+            infer_layout(Path::new("CDS_Trades_27012022.DAT.gz")),
+            Some("cd_trades")
+        );
         assert_eq!(infer_layout(Path::new("something_else.gz")), None);
     }
 
     #[test]
     fn date_is_inferred_from_the_ddmmyyyy_component() {
-        assert_eq!(infer_date(Path::new("CASH_Orders_27012022.DAT.gz")), NaiveDate::from_ymd_opt(2022, 1, 27));
-        assert_eq!(infer_date(Path::new("FAO_Orders_30062022_11.DAT.gz")), NaiveDate::from_ymd_opt(2022, 6, 30));
+        assert_eq!(
+            infer_date(Path::new("CASH_Orders_27012022.DAT.gz")),
+            NaiveDate::from_ymd_opt(2022, 1, 27)
+        );
+        assert_eq!(
+            infer_date(Path::new("FAO_Orders_30062022_11.DAT.gz")),
+            NaiveDate::from_ymd_opt(2022, 6, 30)
+        );
         assert_eq!(infer_date(Path::new("no_date_here.DAT.gz")), None);
         // 32 is not a day, so this must not silently produce a wrong date.
         assert_eq!(infer_date(Path::new("CASH_Orders_32012022.DAT.gz")), None);

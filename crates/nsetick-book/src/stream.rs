@@ -58,12 +58,18 @@ impl SymbolReplay {
     }
 
     /// Read one event. Applies every buffered event the stream has now moved far enough past.
-    pub fn feed(&mut self, ev: &OrderEvent, builder: &mut SnapshotBuilder, interval: i64) -> Progress {
+    pub fn feed(
+        &mut self,
+        ev: &OrderEvent,
+        builder: &mut SnapshotBuilder,
+        interval: i64,
+    ) -> Progress {
         self.book.announce(ev);
         self.pending.push_back(*ev);
         let mut p = Progress::default();
         while let Some(front) = self.pending.front() {
-            if front.timestamp + self.lookahead_micros >= ev.timestamp && self.lookahead_micros > 0 {
+            if front.timestamp + self.lookahead_micros >= ev.timestamp && self.lookahead_micros > 0
+            {
                 break;
             }
             let next = self.pending.pop_front().expect("front exists");
@@ -91,7 +97,11 @@ impl SymbolReplay {
         // snapshot reflects the book as of that instant.
         while ev.timestamp >= *next {
             let now = self.book.stats();
-            builder.push_with(&self.book, *next, IntervalCounts::between(&self.last_stats, &now));
+            builder.push_with(
+                &self.book,
+                *next,
+                IntervalCounts::between(&self.last_stats, &now),
+            );
             self.last_stats = now;
             *next += interval;
             p.snapshots += 1;
@@ -138,8 +148,14 @@ mod tests {
             p += r.feed(e, &mut sb, 1_000_000);
         }
         p += r.finish(&mut sb, 1_000_000);
-        assert_eq!(p.events, 3, "every event is applied once, including the buffered tail");
-        assert_eq!(p.fills, 0, "the buy was cancelled by the exchange as the sell arrived");
+        assert_eq!(
+            p.events, 3,
+            "every event is applied once, including the buffered tail"
+        );
+        assert_eq!(
+            p.fills, 0,
+            "the buy was cancelled by the exchange as the sell arrived"
+        );
         assert_eq!(r.book.stats().self_trade_preventions, 1);
         assert_eq!(r.book.best_ask(), Some(100_00), "the sell rests");
     }

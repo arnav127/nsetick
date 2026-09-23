@@ -39,8 +39,7 @@ impl RecordReader {
     /// Open a `.DAT.gz` (or plain `.DAT`) file for record-aligned reading.
     pub fn open(path: impl AsRef<Path>, line_len: usize, chunk_bytes: usize) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = File::open(&path)
-            .with_context(|| format!("opening {}", path.display()))?;
+        let file = File::open(&path).with_context(|| format!("opening {}", path.display()))?;
         // 1 MB of read-ahead: these files are gigabytes and the default 8 KB is wasteful.
         let buffered = BufReader::with_capacity(1024 * 1024, file);
 
@@ -148,8 +147,8 @@ pub fn read_trigger(data_path: &Path) -> Result<Option<Trigger>> {
     if !trg.exists() {
         return Ok(None);
     }
-    let text = std::fs::read_to_string(&trg)
-        .with_context(|| format!("reading {}", trg.display()))?;
+    let text =
+        std::fs::read_to_string(&trg).with_context(|| format!("reading {}", trg.display()))?;
 
     let mut md5 = None;
     let mut size = None;
