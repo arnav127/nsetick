@@ -8,6 +8,13 @@ intend to use the tool; both come from the same release.
 Requires Python 3.9 or newer. One wheel covers every Python version from 3.9 on.
 
 ```bash
+pip install nsetick
+```
+
+The same wheels are attached to every GitHub release, so you can also install straight from
+there, for instance to pin an exact release or if PyPI is blocked:
+
+```bash
 pip install nsetick --find-links https://github.com/arnav127/nsetick/releases/expanded_assets/v0.2.0
 ```
 
@@ -34,9 +41,6 @@ Check it worked:
 import nsetick
 print(nsetick.__version__, nsetick.layouts())
 ```
-
-If the package is also published on PyPI (see [Releasing](Releasing)), a plain
-`pip install nsetick` works as well.
 
 ### Offline or cluster installs
 

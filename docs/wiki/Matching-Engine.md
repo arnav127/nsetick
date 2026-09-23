@@ -439,12 +439,17 @@ have been discarded, not rested at 100.50.
 * **Price bands, circuit breakers, trading halts, freeze-quantity rejections.** Orders the
   exchange rejected never appear in the orders file, so no model of these is needed.
 * **Where an iceberg's next tranche trades.** When an incoming order uses up an iceberg's
-  visible tranche and still wants more at that price, the exchange sometimes carries on into
-  the same iceberg's next tranche, and sometimes moves on to the next order in the queue. Both
-  happen often (for TCS on 25 Jan 2022: about 23,000 and 30,000 times). Neither order type,
-  IOC or market status, nor tranche number predicts which. The engine always moves on, which
-  matches the majority. This choice is the largest single cause of the remaining difference
-  from the trade file.
+  visible tranche and still wants more at that price, the engine puts the new tranche at the
+  back of the queue. If the iceberg is **alone** at its price, that means it is immediately at
+  the front again, and the incoming order carries on into it. If **other orders** are queued,
+  the incoming order moves on to them first. Measured at every such moment (TCS, INFY and
+  RELIANCE, 25 Jan 2022, about 750,000 cases), the pair ends up trading exactly the
+  exchange's quantity in **97.6%** of cases when the iceberg is alone, but only **87–91%**
+  when other orders are queued. In those misses the exchange took more from the iceberg about as
+  often as it took less. The queued order's age, whether it was just modified, whether it is
+  itself an iceberg, and whether it is older than the iceberg were all checked; none separates
+  the two outcomes. This is the largest single cause of the remaining difference from the trade
+  file, and it changes who traded with whom far more often than how much each order traded.
 * **Client identity.** STP is inferred from timing and participant category. On rare
   occasions, a coincidental cancel in exactly the right slot from a different client of the
   same category would be treated as STP.

@@ -95,6 +95,9 @@ nsetick run study.json
 
 From Python: `nsetick.run_spec("study.json")`.
 
+For a spec that uses every option and most of the filter language, with an explanation of each
+part, see [Advanced Run Spec](Advanced-Run-Spec).
+
 ## Choosing options for a full session
 
 - **Filter early.** `--where "series == 'EQ'"` drops other series before any column is built.

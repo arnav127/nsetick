@@ -1,0 +1,87 @@
+{
+  "defaults": {
+    "out": "../data/parquet",
+    "date": "2022-01-27",
+    "compression": "zstd",
+    "partition_by": "symbol",
+    "threads": 6,
+    "strict": true,
+    "verify_trigger": true,
+    "chunk_mb": 16,
+    "row_group_rows": 1048576,
+    "data_page_kb": 1024,
+    "max_buffered_mb": 6144,
+    "note": "Expiry day 27 Jan 2022: order flow and liquidity around the close"
+  },
+  "jobs": [
+    {
+      "input": "../data/raw/CASH_Orders_27012022.DAT.gz",
+      "out": "../data/parquet/icebergs",
+      "where": "series == 'EQ' and symbol in ('RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'M&M') and activity_type in (1, 4) and volume_disclosed > 0 and volume_original > volume_disclosed",
+      "select": ["symbol", "order_number", "txn_time", "buy_sell", "activity_type", "limit_price", "volume_original", "volume_disclosed", "algo_indicator", "client_identity"],
+      "note": "Iceberg entries and modifies for five large caps. Field-to-field comparison keeps only orders that hide part of their size."
+    },
+    {
+      "input": "../data/raw/CASH_Orders_27012022.DAT.gz",
+      "out": "../data/parquet/closing_aggression",
+      "where": "series == 'EQ' and txn_time >= '15:00:00' and txn_time < '15:30:00' and activity_type == 1 and (mkt_order_flag == true or ioc_flag == true) and algo_indicator in (0, 2)",
+      "select": ["symbol", "order_number", "txn_time", "buy_sell", "limit_price", "volume_original", "mkt_order_flag", "ioc_flag", "algo_indicator"],
+      "note": "Aggressive algorithmic entries (market or IOC) in the last half hour, across the whole EQ universe."
+    },
+    {
+      "input": "../data/raw/CASH_Orders_27012022.DAT.gz",
+      "out": "../data/parquet/stops",
+      "where": "series == 'EQ' and stop_loss_flag == true and ((buy_sell == 'B' and trigger_price <= limit_price) or (buy_sell == 'S' and trigger_price >= limit_price)) and not (client_identity == 2)",
+      "note": "Stop-loss orders with a limit on the far side of the trigger, excluding proprietary flow. All columns."
+    },
+    {
+      "input": "../data/raw/CASH_Orders_27012022.DAT.gz",
+      "out": "../data/parquet/other_series",
+      "where": "series not in ('EQ', 'BE') and activity_type = 1",
+      "partition_by": "series",
+      "compression": "snappy",
+      "note": "New orders in every series other than EQ and BE, partitioned by series instead of symbol."
+    },
+    {
+      "input": "../data/raw/CASH_Trades_27012022.DAT.gz",
+      "out": "../data/parquet/block_algo_trades",
+      "where": "series == 'EQ' and trade_quantity >= 5000 and trade_price >= 100000 and buy_algo_indicator in (0, 2) and sell_algo_indicator in (0, 2) and buy_client_identity != sell_client_identity",
+      "partition_by": null,
+      "note": "Large algo-to-algo trades between different participant categories, above Rs 1,000, in one file."
+    },
+    {
+      "input": "../data/raw/CASH_Trades_27012022.DAT.gz",
+      "out": "../data/parquet/buyer_initiated",
+      "where": "symbol == 'RELIANCE' and buy_order_number > sell_order_number",
+      "select": ["txn_time", "trade_number", "trade_price", "trade_quantity", "buy_order_number", "sell_order_number"],
+      "partition_by": null,
+      "note": "RELIANCE trades whose buy order is the newer of the two: roughly, trades a buyer initiated."
+    },
+    {
+      "input": "../data/raw/FAO_Orders_27012022_01.DAT.gz",
+      "layout": "fao_orders",
+      "out": "../data/parquet/nifty_expiry_options",
+      "where": "instrument == 'OPTIDX' and symbol == 'NIFTY' and expiry_date == '27JAN2022' and option_type in ('CE', 'PE') and strike_price >= 1700000 and strike_price <= 1760000 and spread_type != 'S'",
+      "select": ["symbol", "strike_price", "option_type", "order_number", "txn_time", "buy_sell", "activity_type", "limit_price", "volume_original", "ioc_flag", "algo_indicator"],
+      "partition_by": "option_type",
+      "note": "Expiring near-the-money NIFTY options, spread orders excluded, one partition for calls and one for puts."
+    },
+    {
+      "input": "../data/raw/CASH_Index_27012022.DAT.gz",
+      "out": "../data/parquet/index",
+      "partition_by": null,
+      "compression": "snappy",
+      "note": "NIFTY 50 and NIFTY Next 50, one row per second, unfiltered."
+    },
+    {
+      "input": "../data/raw/CASH_Orders_27012022.DAT.gz",
+      "out": "../data/parquet/smoke",
+      "where": "symbol == 'M&M'",
+      "max_records": 5000000,
+      "strict": false,
+      "verify_trigger": false,
+      "partition_by": null,
+      "note": "Smoke test: the first five million records only, malformed ones counted rather than fatal."
+    }
+  ]
+}

@@ -8,6 +8,7 @@
 - [Python API](Python-API)
 - [Parsing](Parsing)
 - [Filter Language](Filter-Language)
+- [Advanced Run Spec](Advanced-Run-Spec)
 - [Order Book Reconstruction](Order-Book-Reconstruction)
 - [Matching Engine](Matching-Engine)
 

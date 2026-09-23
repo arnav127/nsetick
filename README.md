@@ -1,103 +1,187 @@
 # nsetick
 
 [![CI](https://github.com/arnav127/nsetick/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav127/nsetick/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/arnav127/nsetick)](https://github.com/arnav127/nsetick/releases)
 
-Fast, correct parsing of NSE historical order and trade data into Parquet, and reconstruction
-of the limit order book from it.
+**Turn NSE historical tick data into analysis-ready Parquet and DataFrames, and rebuild the
+limit order book from it.**
 
-**Documentation: [the wiki](https://github.com/arnav127/nsetick/wiki)** — installation, a quick
-start, the Python API, and how the order book replay was validated.
+NSE's historical order and trade files are huge gzipped fixed-width text: one day of Capital
+Market orders is about 8 GB compressed and 700 million records. `nsetick` reads them for you:
 
-NSE ships its historical tick data as gzipped fixed-width text. A single session of Capital
-Market orders is 8.3 GB compressed, 56 GB decompressed, and 684 million records. `nsetick`
-turns that into partitioned Parquet, and is designed to be the one parser shared across every
-project that touches this data.
+- **Parse** a session to Parquet in minutes, keeping only the rows and columns you ask for.
+- **Stream** straight into pandas, Polars, PyArrow or DuckDB, without writing anything to disk.
+- **Rebuild the order book** at any interval: depth, spreads, and the hidden quantity behind
+  iceberg orders, following NSE's matching rules.
+- **Trust the output.** Every byte offset is defined once and checked against each file. The
+  rebuilt book reproduces 94% of the exchange's actual trades exactly, order for order.
 
-## Performance
+It works as a command-line tool and as a Python package. You don't need Rust or a compiler.
 
-Against the DuckDB `read_csv` + `SUBSTRING` approach these pipelines used before, on an
-identical 8,000,000-record fixture, same filter (`series == 'EQ'`), same output shape (one
-Snappy file, all 17 columns), 8-core Windows machine:
+📖 **Full guide: [the wiki](https://github.com/arnav127/nsetick/wiki)**
 
-| | time | output |
-|---|---|---|
-| DuckDB | 22.3 s | 116 MB |
-| nsetick, same shape | **5.7 s** | 116 MB |
-| nsetick, ZSTD, partitioned by symbol | 8.6 s | **72 MB** |
-
-Both produce 7,967,699 rows with identical symbol sets and identical column checksums.
-
-Three things account for it: `zlib-rs` for inflate (582 MB/s vs 324 MB/s for the default
-backend), a pipeline that overlaps inflate with parallel decode and sharded writers, and
-mimalloc, because Arrow arrays are allocated on one thread and freed on another and the
-Windows system allocator serialises badly on that pattern. mimalloc alone was worth 2.4x.
-
-## Why it exists
-
-Byte offsets for these layouts are easy to get subtly wrong, and wrong in ways that produce
-plausible-looking output rather than errors. `nsetick` puts every offset in one versioned
-spec, validates it structurally, and refuses to guess when a file does not match.
+---
 
 ## Install
 
-Prebuilt, no Rust needed. The Python package (Python 3.9+; Linux, macOS, Windows):
+### Python package (Python 3.9+, Linux / macOS / Windows)
+
+```bash
+pip install nsetick
+```
+
+or straight from a GitHub release:
 
 ```bash
 pip install nsetick --find-links https://github.com/arnav127/nsetick/releases/expanded_assets/v0.2.0
 ```
 
-The command-line binary: download the archive for your platform from the
-[releases page](https://github.com/arnav127/nsetick/releases). Linux builds are static and run
-on any distribution.
+`--find-links` points pip at the release page, and pip picks the right wheel for your machine.
+For pandas or Polars output, add `pip install pandas` or `pip install polars`.
 
-From source (Rust 1.95+):
+### Command-line tool
+
+Download the archive for your platform from the
+[latest release](https://github.com/arnav127/nsetick/releases/latest), unpack it, and put
+`nsetick` on your `PATH`:
+
+| Platform | File |
+|---|---|
+| Linux x86_64 | `nsetick-<version>-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM | `nsetick-<version>-aarch64-unknown-linux-musl.tar.gz` |
+| macOS Apple silicon | `nsetick-<version>-aarch64-apple-darwin.tar.gz` |
+| macOS Intel | `nsetick-<version>-x86_64-apple-darwin.tar.gz` |
+| Windows | `nsetick-<version>-x86_64-pc-windows-msvc.zip` |
 
 ```bash
-cargo build --release
-./target/release/nsetick --help
+tar xzf nsetick-0.2.0-x86_64-unknown-linux-musl.tar.gz
+./nsetick-0.2.0-x86_64-unknown-linux-musl/nsetick --version
 ```
 
-Details, including offline installs on compute clusters, are on the
+The Linux builds are static, so they run on any distribution, including old cluster nodes.
+Offline installs, checksums and building from source are covered on the
 [Installation](https://github.com/arnav127/nsetick/wiki/Installation) page.
 
-## Use
+---
+
+## Quick tour
+
+### Look at a file
 
 ```bash
-# Parse a session. Layout and date are inferred from the file name.
-nsetick parse CASH_Orders_27012022.DAT.gz --out ./parquet
-
-# Only the columns you need, only the rows you want.
-nsetick parse CASH_Orders_27012022.DAT.gz --out ./parquet \
-  --select symbol,txn_time,limit_price,volume_original \
-  --where "series == 'EQ' and symbol in ('RELIANCE','TCS','M&M')"
-
-# What layouts exist, and what is in one.
-nsetick layouts
-nsetick describe cm_orders --date 2022-01-27
-
-# Decode the first few records without writing anything.
-nsetick inspect CASH_Orders_27012022.DAT.gz --n 5
+nsetick inspect CASH_Orders_25012022.DAT.gz --n 5      # decode the first five records
+nsetick describe cm_orders                             # what fields the file has
 ```
 
-### Run specs
+nsetick works out the file type and session date from the NSE file name.
 
-Anything the command line can express can also be a JSON file, which is the better option
-when the run is part of a study and needs to be reproducible. Unknown fields are rejected, so
-a typo is an error rather than a silently ignored setting.
+### Parse to Parquet
 
 ```bash
-nsetick run study.json            # execute
-nsetick run study.json --dry-run  # show the resolved jobs and stop
+nsetick parse CASH_Orders_25012022.DAT.gz --out data/parquet
 ```
+
+Only the columns and rows you need:
+
+```bash
+nsetick parse CASH_Orders_25012022.DAT.gz --out data/parquet \
+  --select symbol,txn_time,buy_sell,limit_price,volume_original \
+  --where "series == 'EQ' and symbol in ('RELIANCE', 'TCS', 'M&M')"
+```
+
+The output is ordinary partitioned Parquet, one directory per symbol, already in time order:
+
+```text
+data/parquet/segment=cm/kind=orders/date=2022-01-25/symbol=RELIANCE/part-000.parquet
+```
+
+Read it with any tool:
+
+```sql
+-- DuckDB
+SELECT symbol, COUNT(*) FROM read_parquet('data/parquet/**/*.parquet', hive_partitioning = 1)
+GROUP BY symbol;
+```
+
+### Straight into Python
+
+```python
+import nsetick
+
+df = nsetick.to_pandas(
+    "CASH_Trades_25012022.DAT.gz",
+    where="symbol == 'INFY' and txn_time >= '15:00:00'",
+    select=["txn_time", "trade_price", "trade_quantity"],
+)
+```
+
+For a whole session, stream it in batches. Memory stays flat however big the file is:
+
+```python
+for batch in nsetick.iter_batches("CASH_Orders_25012022.DAT.gz", where="series == 'EQ'"):
+    ...  # a pyarrow.RecordBatch
+```
+
+### Filters
+
+Filters run before any data is decoded, so selective ones are nearly free:
+
+```text
+series == 'EQ' and activity_type == 1                     new EQ orders
+txn_time >= '09:15:00' and txn_time < '09:30:00'          a time window
+mkt_order_flag == true or ioc_flag == true                aggressive orders
+volume_original > volume_disclosed and volume_disclosed > 0    iceberg orders
+symbol not in ('IDEA', 'YESBANK')
+```
+
+Prices are in paise: `limit_price > 250000` means above ₹2,500. A misspelt field name is an
+error before the file is opened, not an empty result an hour later. See the
+[Filter Language](https://github.com/arnav127/nsetick/wiki/Filter-Language).
+
+### Rebuild the order book
+
+From parsed orders, a snapshot of each symbol's book every second, 20 levels deep:
+
+```bash
+nsetick book data/parquet/segment=cm/kind=orders/date=2022-01-25 --out data/books --interval 1 --levels 20
+```
+
+```python
+nsetick.build_books("data/parquet/segment=cm/kind=orders/date=2022-01-25",
+                    out="data/books", interval_secs=1.0, levels=20, symbols=["TCS", "INFY"])
+```
+
+Each snapshot row has best bid and ask, spread, price and quantity per level, the **hidden**
+quantity behind iceberg orders at each level, the make-up of the best quote (algorithmic,
+institutional, iceberg), and counts of what happened since the previous snapshot. See
+[Order Book Reconstruction](https://github.com/arnav127/nsetick/wiki/Order-Book-Reconstruction).
+
+The book follows NSE's rules, including the non-obvious ones: market orders, IOC, stop-loss,
+iceberg replenishment, and self-trade prevention. The
+[Matching Engine](https://github.com/arnav127/nsetick/wiki/Matching-Engine) page explains each
+step with diagrams.
+
+### Check the book against the exchange
+
+The trade file names the buy and sell order of every trade. `replay_fills` gives you the same
+for the rebuilt book, so you can compare them directly:
+
+```python
+fills = nsetick.replay_fills("data/parquet/segment=cm/kind=orders/date=2022-01-25", symbols=["TCS"])
+```
+
+Over 33 million trades (24 sessions, 10 large stocks), the rebuilt book reproduces **94%** of
+trades exactly (same two orders, price and quantity). **99.2%** of orders execute exactly the
+quantity the exchange executed. See
+[Validation and Accuracy](https://github.com/arnav127/nsetick/wiki/Validation-and-Accuracy).
+
+### Keep a study reproducible
+
+Put the runs in a JSON file under version control instead of shell history:
 
 ```json
 {
-  "defaults": {
-    "out": "data/parquet",
-    "where": "series == 'EQ'",
-    "threads": 6,
-    "note": "2022 expiry-day study: all EQ series, full universe"
-  },
+  "defaults": { "out": "data/parquet", "where": "series == 'EQ'", "note": "expiry-day study" },
   "jobs": [
     { "input": "data/raw/CASH_Orders_27012022.DAT.gz" },
     { "input": "data/raw/CASH_Trades_27012022.DAT.gz" }
@@ -105,185 +189,57 @@ nsetick run study.json --dry-run  # show the resolved jobs and stop
 }
 ```
 
-Job fields override `defaults`. Relative paths resolve against the spec file, so a spec
-travels with the data it describes. `layout` and `date` are inferred from the file name
-unless set. `note` is carried into the manifest. See [`examples/session.json`](examples/session.json).
-
-Read the result from anywhere:
-
-```sql
-SELECT * FROM read_parquet('parquet/**/*.parquet', hive_partitioning = 1)
-WHERE symbol = 'RELIANCE';
-```
-
-## Python
-
-Stream Arrow batches straight into a process, no Parquet round trip, memory flat regardless
-of session size:
-
-```python
-import nsetick
-
-for batch in nsetick.iter_batches(
-    "CASH_Orders_27012022.DAT.gz",
-    where="symbol == 'RELIANCE' and activity_type == 1",
-    select=["symbol", "txn_time", "limit_price", "volume_original"],
-):
-    df = batch.to_pandas()
-```
-
-Or write Parquet, the same as the CLI:
-
-```python
-nsetick.parse(path, out="data/parquet", where="series == 'EQ'", threads=6)
-nsetick.run_spec("study.json")
-```
-
-Streaming is about 1.6x faster than going through Parquet (2.36 s vs 3.89 s for 8M records),
-because it skips Parquet encoding entirely, and a selective filter runs at the speed of gzip
-decompression. Calling from Python costs nothing over the CLI. Numbers in
-[`docs/python.md`](docs/python.md).
-
-Plus `to_pandas`, `to_polars`, `read_table`, `describe`, `probe`, `memory_estimate` and
-`check_filter`, which validates a filter against a layout in milliseconds so a typo fails
-before an hour of parsing rather than after it.
-
-Full guide, including how to migrate the existing DuckDB parsers:
-[`docs/python.md`](docs/python.md).
-
-## Order books
-
-Replay order events into a limit order book per symbol and write periodic L2 snapshots:
-
 ```bash
-nsetick book parquet/segment=cm/kind=orders/date=2022-01-27 --out books --interval 1 --levels 20
+nsetick run study.json --dry-run    # check what will run
+nsetick run study.json
 ```
 
-```python
-nsetick.build_books("parquet/segment=cm/kind=orders/date=2022-01-27", out="books", symbols=["TCS"])
-```
+Each output directory gets a manifest recording the source file, filter, columns and your note.
+For a spec that uses every option, see
+[Advanced Run Spec](https://github.com/arnav127/nsetick/wiki/Advanced-Run-Spec).
 
-The replay implements NSE's matching rules — disclosed-quantity orders and their replenishment
-at the back of the queue, market, IOC and stop-loss orders, and self-trade prevention — and was
-checked against the exchange's own trade file: it matches within about 0.3-2.3% of the volume
-actually traded for most securities. Snapshots carry visible and hidden quantity per level, the
-composition of the touch, and per-interval event counts. See
-[Order Book Reconstruction](https://github.com/arnav127/nsetick/wiki/Order-Book-Reconstruction)
-and [Validation and Accuracy](https://github.com/arnav127/nsetick/wiki/Validation-and-Accuracy).
+---
 
-## Filter language
+## Supported data
 
-```text
-expr       := or_expr
-or_expr    := and_expr ('or' and_expr)*
-and_expr   := unary ('and' unary)*
-unary      := 'not' unary | '(' expr ')' | comparison
-comparison := field op literal
-            | field op field
-            | field ['not'] 'in' '(' literal, ... ')'
-op         := '==' | '=' | '!=' | '<' | '<=' | '>' | '>='
-```
+| Segment | Orders | Trades | Index |
+|---|---|---|---|
+| Capital Market (`CASH_*`) | ✓ | ✓ | ✓ |
+| Futures & Options (`FAO_*`) | ✓ (2022 layouts verified) | ✓ (2022 layouts verified) | |
+| Currency Derivatives (`CD_*`) | from the specification | from the specification | |
 
-Two numeric fields of the same record can be compared, which pushes a derived condition down
-into the scan instead of computing it afterwards:
+Order book reconstruction is available for Capital Market orders. The files differ between
+segments and have changed over the years. nsetick picks the right layout by date and checks it
+against the file, and refuses the file rather than guessing if they disagree.
 
-```
-series == 'EQ' and volume_original > volume_disclosed and volume_disclosed > 0
-```
+## Speed
 
-Both sides must share a scale, so a price cannot be silently compared against a share count.
+A full Capital Market session parses in a few minutes on a laptop, 3–4× faster than DuckDB's
+fixed-width parsing, and uses about 2 MB of memory per output partition. Book reconstruction
+for a full session takes about 8 minutes on 8 cores. See
+[Performance and Memory](https://github.com/arnav127/nsetick/wiki/Performance-and-Memory).
 
-Filters compile to byte comparisons at resolved offsets and run before any column is built,
-so a rejected record costs almost nothing. Field names are checked at compile time: a typo is
-an error before the file is opened, not an empty result afterwards.
+## Help
 
-Prices compare in raw integer units, so `limit_price > 250000` means above 2500.00 rupees in
-the Capital Market segment. Time literals must be quoted and resolve through the session
-date: `txn_time >= '09:15:00'`.
+- [Troubleshooting](https://github.com/arnav127/nsetick/wiki/Troubleshooting) covers the common
+  errors and what they mean.
+- Found a bug or a file nsetick won't read? [Open an issue](https://github.com/arnav127/nsetick/issues)
+  with the file name and the output of `nsetick --version`.
 
-## Output layout
+## Data licence
 
-```text
-<root>/segment=cm/kind=orders/date=2022-01-27/symbol=RELIANCE/part-000.parquet
-<root>/_manifest.cm_orders.2022-01-27.json
-```
+NSE historical data is licensed. nsetick contains no data and none can be shared with it.
+Obtain the files through your institution's NSE subscription.
 
-Partitioning by symbol is free: NSE writes each symbol's records contiguously and in time
-order, so the partitions come out time-sorted with no sort step. Every run writes a manifest
-recording the source file, layout version, filter, projection, note and row counts, so a
-directory of Parquet can be traced back to what produced it.
+## Citing
 
-Useful knobs: `--partition-by none` for a single file per date, `-j/--threads` for worker
-count, `--compression snappy|zstd|none` (Snappy by default; ZSTD is about a third smaller),
-`--row-group-rows`, `--data-page-kb`, `--memory-limit-mb`, `--chunk-mb`, and `--max-records`
-for smoke tests on multi-gigabyte files.
+If nsetick helps your research, please cite it with the version you used:
 
-## Memory
+> Dixit, A. *nsetick: parsing and order book reconstruction for NSE historical tick data.*
+> https://github.com/arnav127/nsetick
 
-Partitioning by symbol keeps one Parquet writer open per symbol for the whole run, because
-NSE interleaves every symbol throughout the session and a closed Parquet file cannot be
-reopened to append. That, not buffering, is what decides whether a run fits:
+Order book output changed materially in 0.2.0; see the [changelog](CHANGELOG.md).
 
-| configuration | peak RSS |
-|---|---|
-| one file, 1 thread | 269 MB |
-| one file, 6 threads | 532 MB |
-| 620 symbol partitions, 1 thread | 1.56 GB |
-| 620 symbol partitions, 6 threads | 2.02 GB |
+## Licence
 
-So roughly **2 MB per open partition**, independent of row-group budget or page size. A full
-~2000-symbol Capital Market session therefore plans for about 5 GB and fits comfortably in
-8 GB.
-
-`nsetick` derives a footprint ceiling from the memory actually available when it starts and
-checks it as each partition is opened, so a run that cannot fit **stops with an explanation
-and suggested remedies rather than exhausting the machine**. Override it with
-`--memory-limit-mb`. Every run reports what it used:
-
-```text
-memory            ~1.5 GB peak of 9.7 GB limit (619 partitions open)
-```
-
-Raising the buffer budget does not buy throughput: measured across budgets from 64 MB to
-3 GB, an 8M-record session took 7.4s to 7.9s, which is noise. The knob that matters is
-`-j/--threads` (0.71 to 1.21 M rows/s going from 1 to 6).
-
-## Layouts
-
-| layout | segment | record length |
-|---|---|---|
-| `cm_orders` | CM | 87 |
-| `cm_trades` | CM | 100 |
-| `cm_index` | CM | 38 |
-| `fao_orders` | FAO | 112, 111 before spec 1.7 (unverified) |
-| `fao_trades` | FAO | 124, 123 before 2020-09-07 (unverified) |
-| `cd_orders` | CD | 112, 111 before spec 1.7 (unverified) |
-| `cd_trades` | CD | 123 (unverified) |
-
-Layout versions are selected by session date and then cross-checked against the record length
-observed in the file, which wins if the two disagree. Unverified layouts are transcribed from
-the specification but not yet checked against a real file.
-
-See [`spec/README.md`](spec/README.md) for the quirks of the real data: the literal `b`
-padding byte, symbols containing `&`, the scale-4 prices in Currency Derivatives, and the
-fact that Capital Market files are internally split by symbol range.
-
-## Layout
-
-```text
-spec/layouts/*.toml     the single source of truth for every byte offset
-crates/nsetick-core     layout registry, decoder, filter engine
-crates/nsetick-io       gzip reader, partitioned Parquet writer, manifests
-crates/nsetick-book     order book replay and L2 snapshots
-crates/nsetick-cli      the nsetick binary
-crates/nsetick-py       PyO3 bindings
-python/nsetick          the Python package; reference decoder
-```
-
-## Data
-
-NSE historical data is licensed; none is included here or can be distributed with this tool.
-
-## License
-
-MIT. See [LICENSE](LICENSE) and the [changelog](CHANGELOG.md).
+MIT. See [LICENSE](LICENSE).

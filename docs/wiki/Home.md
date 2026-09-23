@@ -30,6 +30,7 @@ It is a command-line tool and a Python package, built on a Rust core.
 ## Reference
 
 - [Filter Language](Filter-Language)
+- [Advanced Run Spec](Advanced-Run-Spec) — one large spec using every option and filter feature
 - [Order Book Reconstruction](Order-Book-Reconstruction) — snapshots and their columns
 - [Matching Engine](Matching-Engine) — how the replay matches orders, step by step, with diagrams
 - [Data Layouts and Quirks](Data-Layouts-and-Quirks) — what the raw files actually contain
