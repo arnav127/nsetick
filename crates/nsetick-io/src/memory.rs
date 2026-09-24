@@ -52,6 +52,9 @@ pub struct MemoryGuard {
     /// Total process footprint the run is allowed to plan for.
     footprint_limit: usize,
     per_partition: usize,
+    /// Refuse partitions beyond the process's open-file limit (see crate::fdlimit). Off only
+    /// for `unlimited`, which by definition refuses nothing.
+    check_open_files: bool,
 }
 
 impl MemoryGuard {
@@ -64,12 +67,17 @@ impl MemoryGuard {
             partitions_peak: AtomicUsize::new(0),
             footprint_limit,
             per_partition: BYTES_PER_OPEN_PARTITION,
+            check_open_files: true,
         })
     }
 
     /// A guard that never fires, for tests and single-partition writes.
     pub fn unlimited() -> Arc<Self> {
-        MemoryGuard::new(usize::MAX, usize::MAX / 2)
+        let mut g = MemoryGuard::new(usize::MAX, usize::MAX / 2);
+        Arc::get_mut(&mut g)
+            .expect("freshly created, so not shared")
+            .check_open_files = false;
+        g
     }
 
     /// Record that a partition's in-progress buffer changed from `before` to `after`.
@@ -123,7 +131,10 @@ impl MemoryGuard {
             );
         }
         // Every open partition is also an open file; see crate::fdlimit.
-        crate::fdlimit::check(n as u64, layout_hint)
+        if self.check_open_files {
+            crate::fdlimit::check(n as u64, layout_hint)?;
+        }
+        Ok(())
     }
 
     pub fn close_partition(&self) {
@@ -312,6 +323,18 @@ mod tests {
         for _ in 0..50_000 {
             g.open_partition("symbol").unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn partitions_beyond_the_open_file_limit_are_refused() {
+        let g = MemoryGuard::new(usize::MAX, 0);
+        let limit = crate::fdlimit::ensure().expect("unix has a limit");
+        for _ in 0..limit - crate::fdlimit::RESERVED {
+            g.open_partition("symbol").unwrap();
+        }
+        let err = g.open_partition("symbol").unwrap_err().to_string();
+        assert!(err.contains("open-file limit"), "{err}");
     }
 
     #[test]
