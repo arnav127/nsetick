@@ -79,6 +79,11 @@ jobs:
           # Tests needing a real NSE file skip without NSETICK_TEST_FILE; the data is licensed
           # and cannot be committed.
           python -m pytest python/tests -q
+          # The package installs the command line too.
+          nsetick --version
+          python -m nsetick layouts
+          # Output closed early must end the command quietly, not in a panic.
+          nsetick layouts | head -1
 
   layouts:
     name: layout specs

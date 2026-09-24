@@ -1,7 +1,8 @@
 # Installation
 
-Prebuilt downloads need nothing else installed: no Rust, no compiler. Pick whichever way you
-intend to use the tool; both come from the same release.
+Prebuilt downloads need nothing else installed: no Rust, no compiler. `pip install nsetick`
+gives you both the Python package and the `nsetick` command; the standalone binary is for
+machines without Python.
 
 ## Python package
 
@@ -54,6 +55,9 @@ pip install --user nsetick-0.2.0-cp39-abi3-manylinux_2_17_x86_64.manylinux2014_x
 `pyarrow` is the only dependency; install it the same way if the cluster cannot reach PyPI.
 
 ## Command-line binary
+
+The Python package already installs the `nsetick` command (also `python -m nsetick`), the same
+program as the standalone binary. Use the binary on a machine without Python.
 
 Download the archive for your platform from the
 [releases page](https://github.com/arnav127/nsetick/releases), unpack it, and put `nsetick`

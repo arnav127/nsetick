@@ -778,7 +778,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-book"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -791,12 +791,13 @@ dependencies = [
 
 [[package]]
 name = "nsetick-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
  "chrono",
  "clap",
+ "libc",
  "mimalloc",
  "nsetick-book",
  "nsetick-core",
@@ -806,7 +807,7 @@ dependencies = [
 
 [[package]]
 name = "nsetick-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -817,13 +818,14 @@ dependencies = [
 
 [[package]]
 name = "nsetick-io"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
  "chrono",
  "crossbeam-channel",
  "flate2",
+ "libc",
  "nsetick-core",
  "parquet",
  "serde",
@@ -833,12 +835,13 @@ dependencies = [
 
 [[package]]
 name = "nsetick-py"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "arrow",
  "chrono",
  "nsetick-book",
+ "nsetick-cli",
  "nsetick-core",
  "nsetick-io",
  "parquet",

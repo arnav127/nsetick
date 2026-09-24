@@ -22,6 +22,13 @@ remedies: filter to fewer symbols, `--partition-by none`, fewer `--threads`, or 
 `--memory-limit-mb` if you know more memory is available. See
 [Performance and Memory](Performance-and-Memory).
 
+**"Too many open files", or "open-file limit: N open partitions need …"**
+A partitioned run keeps one file open per symbol for its whole length, and a full universe is
+over a thousand symbols. nsetick raises the process's open-file limit itself on Linux and macOS,
+as far as the system's hard limit allows (0.2.2 and later). If the hard limit is lower than the
+run needs, raise it (`ulimit -n 65536`, or `nofile` in `/etc/security/limits.conf`), narrow the
+run with `--where`, or use `--partition-by none`.
+
 **A filter returns no rows**
 - Prices are integer paise: `limit_price > 2500` means above ₹25.00, not ₹2,500.
 - Symbols are exact and case-sensitive: `'BAJAJ-AUTO'`, `'M&M'`.

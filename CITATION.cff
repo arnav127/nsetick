@@ -8,7 +8,7 @@ authors:
 repository-code: "https://github.com/arnav127/nsetick"
 url: "https://github.com/arnav127/nsetick/wiki"
 license: MIT
-version: 0.2.1
+version: 0.2.2
 date-released: "2026-09-24"
 keywords:
   - NSE

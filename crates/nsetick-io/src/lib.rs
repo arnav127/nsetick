@@ -4,6 +4,7 @@ use std::path::Path;
 
 use chrono::NaiveDate;
 
+pub mod fdlimit;
 pub mod manifest;
 pub mod memory;
 pub mod pipeline;

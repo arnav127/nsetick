@@ -11,6 +11,9 @@ readme = "README.md"
 dependencies = ["pyarrow>=14", "tomli>=1.1; python_version < '3.11'"]
 dynamic = ["version"]
 
+[project.scripts]
+nsetick = "nsetick.__main__:main"
+
 [project.optional-dependencies]
 pandas = ["pandas>=2.0"]
 polars = ["polars>=0.20"]

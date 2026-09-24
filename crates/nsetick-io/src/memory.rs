@@ -122,7 +122,8 @@ impl MemoryGuard {
                 human(self.per_partition),
             );
         }
-        Ok(())
+        // Every open partition is also an open file; see crate::fdlimit.
+        crate::fdlimit::check(n as u64, layout_hint)
     }
 
     pub fn close_partition(&self) {

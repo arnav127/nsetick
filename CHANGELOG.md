@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.2
+
+- **`pip install nsetick` installs the `nsetick` command too**, the same program as the
+  standalone binary; `python -m nsetick` also works. Ctrl-C ends it at once and a closed pipe
+  (`nsetick layouts | head`) ends it quietly, as for any command line tool.
+- **nsetick raises the open-file limit itself.** A partitioned run keeps a file open per
+  symbol, and a full universe is well past Linux's usual soft limit of 1024, so large runs
+  failed with "Too many open files" unless the caller had run `ulimit -n` first. The limit is
+  now raised to the hard limit (capped at 65536; 10240 on macOS), and a hard limit too low for
+  the run is reported up front with the remedy.
+- The standalone binary exits quietly, not in a panic, when its output is closed early.
+
 ## 0.2.1
 
 - **Book snapshots fall on the clock.** `snapshot_time` is now a whole multiple of the interval

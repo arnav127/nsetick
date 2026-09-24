@@ -40,7 +40,10 @@ pip install nsetick --find-links https://github.com/arnav127/nsetick/releases/ex
 `--find-links` points pip at the release page, and pip picks the right wheel for your machine.
 For pandas or Polars output, add `pip install pandas` or `pip install polars`.
 
-### Command-line tool
+This installs the `nsetick` command as well (`nsetick --help`), so the examples below work
+straight after it.
+
+### Standalone command-line tool (no Python needed)
 
 Download the archive for your platform from the
 [latest release](https://github.com/arnav127/nsetick/releases/latest), unpack it, and put

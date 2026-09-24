@@ -579,8 +579,16 @@ fn replay_fills(
     Ok(PyArrowType(batch))
 }
 
+/// Run the `nsetick` command line with `argv` (program name first) and return its exit code.
+/// Backs the `nsetick` console script and `python -m nsetick`.
+#[pyfunction]
+fn cli(py: Python<'_>, argv: Vec<String>) -> i32 {
+    py.detach(|| nsetick_cli::run(argv))
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(cli, m)?)?;
     m.add_class::<BatchReader>()?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(run_spec, m)?)?;

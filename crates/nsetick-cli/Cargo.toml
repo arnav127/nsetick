@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "nsetick_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nsetick"
 path = "src/main.rs"
@@ -21,3 +25,6 @@ nsetick-core.workspace = true
 nsetick-io.workspace = true
 nsetick-book.workspace = true
 parquet = { version = "59.3.0", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

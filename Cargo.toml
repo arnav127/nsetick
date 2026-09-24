@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/nsetick-core", "crates/nsetick-io", "crates/nsetick-cli", "crates/nsetick-py", "crates/nsetick-book"]
 
 [workspace.package]
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT"
@@ -17,6 +17,7 @@ toml = "0.8"
 nsetick-core = { path = "crates/nsetick-core" }
 nsetick-io = { path = "crates/nsetick-io" }
 nsetick-book = { path = "crates/nsetick-book" }
+nsetick-cli = { path = "crates/nsetick-cli" }
 
 [profile.release]
 opt-level = 3
