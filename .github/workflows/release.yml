@@ -124,7 +124,8 @@ jobs:
           python -m pip install dist/*.whl
           python -c "import nsetick; print(nsetick.__version__, nsetick.layouts())"
           nsetick --version
-          nsetick layouts | head -1
+          (set +o pipefail; nsetick layouts 2> stderr.txt | head -1)
+          if grep -qi panic stderr.txt; then cat stderr.txt; exit 1; fi
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.platform }}

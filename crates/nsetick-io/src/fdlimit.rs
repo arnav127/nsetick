@@ -63,17 +63,16 @@ fn raise() -> Option<u64> {
         }
         let hard = rl.rlim_max as u64;
         let current = rl.rlim_cur as u64;
+        // macOS may report an unlimited hard limit yet refuse anything above a ceiling of its
+        // own (kern.maxfilesperproc, OPEN_MAX), so a refusal is answered by asking for less
+        // until the request is accepted or no better than what is already in force.
         let mut want = TARGET.min(hard);
-        // macOS reports an unlimited hard limit but refuses a soft limit above OPEN_MAX.
-        if cfg!(target_os = "macos") {
-            want = want.min(10_240);
-        }
-        if want > current {
+        while want > current {
             rl.rlim_cur = want as libc::rlim_t;
-            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
-                return Some(current);
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
+                return Some(want);
             }
-            return Some(want);
+            want /= 2;
         }
         Some(current)
     }
@@ -101,12 +100,10 @@ mod tests {
             rl.rlim_cur as u64, limit,
             "the limit in force is the one reported"
         );
-        let reachable = if cfg!(target_os = "macos") {
-            10_240
-        } else {
-            TARGET
-        };
-        assert!(limit >= reachable.min(rl.rlim_max as u64));
+        // Linux honours any soft limit up to the hard limit; macOS caps it by its own rules.
+        if cfg!(target_os = "linux") {
+            assert!(limit >= TARGET.min(rl.rlim_max as u64));
+        }
     }
 
     #[test]

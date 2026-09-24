@@ -82,8 +82,10 @@ jobs:
           # The package installs the command line too.
           nsetick --version
           python -m nsetick layouts
-          # Output closed early must end the command quietly, not in a panic.
-          nsetick layouts | head -1
+          # Output closed early must end the command quietly, not in a panic. The command may
+          # die of SIGPIPE, which is the point, so pipefail is off for this one line.
+          (set +o pipefail; nsetick layouts 2> stderr.txt | head -1)
+          if grep -qi panic stderr.txt; then cat stderr.txt; exit 1; fi
 
   layouts:
     name: layout specs
